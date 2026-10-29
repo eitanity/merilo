@@ -5,100 +5,104 @@ import (
 	"fmt"
 )
 
+// errReentered refuses a call into merilo from an adapter method that
+// merilo is running.
+const errReentered = constError("merilo: called again from inside a run: an adapter method must not call merilo")
+
 // applied is the outcome of one Apply or Check: kindNone when it passed.
 type applied struct {
 	kind   ViolationKind
 	detail string
 }
 
-// driver applies steps to a System and recovers panics from Apply.
+// driver applies step kinds to a System.
 type driver struct {
 	sys   System
 	kinds int
-	steps []Step
-	last  applied
 }
 
-func newDriver(sys System) *driver {
-	assert(sys != nil, "nil System")
+func newDriver(sys System) (driver, error) {
+	if sys == nil {
+		return driver{}, errors.New("merilo: nil System")
+	}
+	if again := reentered(); again {
+		return driver{}, errReentered
+	}
 	kinds := sys.Kinds()
-	assert(kinds > 0, "Kinds() must be positive")
-	return &driver{sys: sys, kinds: kinds, steps: make([]Step, 0, 16)}
-}
-
-// enabled returns the enabled steps. The next call reuses the slice.
-func (d *driver) enabled() []Step {
-	assert(d.sys != nil, "driver without System")
-	d.steps = d.sys.Steps(d.steps[:0])
-	assert(len(d.steps) < 1<<20, "Steps returned an implausible number of steps")
-	return d.steps
-}
-
-// apply applies s and classifies any failure.
-func (d *driver) apply(s Step) applied {
-	assert(d.sys != nil, "driver without System")
-	assert(d.kinds > 0, "driver without kinds")
-	if int(s.Kind) >= d.kinds {
-		return applied{kind: ApplyError, detail: fmt.Sprintf("step kind %d is not below Kinds() = %d", s.Kind, d.kinds)}
+	if kinds <= 0 || kinds > maxKinds {
+		return driver{}, fmt.Errorf("merilo: Kinds() is %d; it must be from 1 to %d", kinds, maxKinds)
 	}
-	d.last = applied{}
-	d.run(s)
-	return d.last
+	return driver{sys: sys, kinds: kinds}, nil
 }
 
-func (d *driver) run(s Step) {
-	assert(d.last.kind == kindNone, "run with a stale outcome")
-	assert(int(s.Kind) < d.kinds, "run with an undeclared kind")
-	defer d.catch()
-	err := d.sys.Apply(s)
-	switch {
-	case err == nil:
-	case errors.Is(err, ErrModeChange):
-		d.last = applied{kind: ModeChange, detail: err.Error()}
-	default:
-		d.last = applied{kind: ApplyError, detail: err.Error()}
+// enabled reports whether step kind k can be taken in the current world.
+func (d *driver) enabled(k int) bool {
+	if d == nil || d.sys == nil {
+		return false
 	}
+	if k < 0 || k >= d.kinds {
+		return false
+	}
+	return d.sys.Enabled(k)
 }
 
-func (d *driver) catch() {
-	assert(d.sys != nil, "catch without System")
-	assert(d.kinds > 0, "catch without kinds")
-	if v := recover(); v != nil {
-		d.last = applied{kind: Panic, detail: fmt.Sprint(v)}
+// stuck reports whether no step kind is enabled in the current world.
+func (d *driver) stuck() bool {
+	if d == nil || d.sys == nil {
+		return true
 	}
+	kinds := d.kinds
+	for k := 0; k < kinds; k++ {
+		if d.sys.Enabled(k) {
+			return false
+		}
+	}
+	return true
+}
+
+// apply takes step kind k and classifies any failure. A kind that is not
+// enabled in the current world fails as an apply error.
+func (d *driver) apply(k int) applied {
+	if d == nil || d.sys == nil {
+		return applied{kind: ApplyError, detail: "internal error: apply without a System"}
+	}
+	if k < 0 || k >= d.kinds {
+		return applied{kind: ApplyError, detail: fmt.Sprintf("step kind %d is not below Kinds() = %d", k, d.kinds)}
+	}
+	if enabled := d.sys.Enabled(k); !enabled {
+		return applied{kind: ApplyError, detail: fmt.Sprintf("step kind %d is not enabled in this world", k)}
+	}
+	err := d.sys.Apply(k)
+	if mode := errors.Is(err, ErrModeChange); mode {
+		return applied{kind: ModeChange, detail: err.Error()}
+	}
+	if err != nil {
+		return applied{kind: ApplyError, detail: err.Error()}
+	}
+	return applied{}
 }
 
 // check runs the invariants on the current world.
 func (d *driver) check() applied {
-	assert(d.sys != nil, "driver without System")
+	if d == nil || d.sys == nil {
+		return applied{kind: ApplyError, detail: "internal error: check without a System"}
+	}
 	if err := d.sys.Check(); err != nil {
-		assert(err.Error() != "", "Check returned an error with no text")
 		return applied{kind: Invariant, detail: err.Error()}
 	}
 	return applied{}
 }
 
-// stuck reports whether the current world has no enabled step and is
-// not settled by design.
-func (d *driver) stuck() bool {
-	assert(d.sys != nil, "driver without System")
-	assert(d.kinds > 0, "driver without kinds")
-	return len(d.enabled()) == 0 && !d.sys.Settled()
-}
-
 // replay resets the system and follows tr. It stops at the first failure,
-// including a position the current world does not have.
+// including a kind the current world does not enable.
 func (d *driver) replay(tr Trace) applied {
-	assert(d.sys != nil, "driver without System")
-	assert(d.kinds > 0, "driver without kinds")
+	if d == nil || d.sys == nil {
+		return applied{kind: ApplyError, detail: "internal error: replay without a System"}
+	}
 	d.sys.Reset()
-	for i, p := range tr {
-		steps := d.enabled()
-		if p < 0 || p >= len(steps) {
-			return applied{kind: ApplyError, detail: fmt.Sprintf(
-				"step %d: position %d is not below the %d enabled steps; the trace no longer fits the system", i, p, len(steps))}
-		}
-		if a := d.apply(steps[p]); a.kind != kindNone {
+	for i, k := range tr {
+		if a := d.apply(k); a.kind != kindNone {
+			a.detail = fmt.Sprintf("step %d: %s", i, a.detail)
 			return a
 		}
 		if a := d.check(); a.kind != kindNone {

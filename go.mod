@@ -1,3 +1,3 @@
-module github.com/eitanity/merilo
+module code.eitanity.com/merilo
 
 go 1.22

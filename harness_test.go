@@ -3,10 +3,11 @@ package merilo
 import (
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"strings"
 	"testing"
+
+	"code.eitanity.com/merilo/fsm"
 )
 
 // toy is a counter from 0 to limit with switchable faults. Positions
@@ -17,22 +18,21 @@ type toy struct {
 	settledAt  int    // Settled is also true at this value
 	failAt     int    // Check fails at this value
 	errAt      int    // Apply returns an error reaching this value
-	panicAt    int    // Apply panics reaching this value
 	modeErrAt  int    // Apply returns ErrModeChange reaching this value
-	highAt     int    // mode is "high" from this value on
-	badKind    bool   // Steps offers a kind beyond Kinds()
-	twoWays    bool   // two steps per world, offered in map order
 	impure     *int   // a counter outside the path that Apply reads
 	noInv      bool   // Invariants is empty
 	label      string // Describe prefix
+
+	kinds int // Kinds(); 2 when zero
 }
 
-type toyMode string
-
-func (m toyMode) String() string { return string(m) }
-
-func (s *toy) Reset()     { s.n = 0 }
-func (s *toy) Kinds() int { return 2 }
+func (s *toy) Reset() { s.n = 0 }
+func (s *toy) Kinds() int {
+	if s.kinds != 0 {
+		return s.kinds
+	}
+	return 2
+}
 
 func (s *toy) Invariants() []string {
 	if s.noInv {
@@ -41,40 +41,27 @@ func (s *toy) Invariants() []string {
 	return []string{"n is never failAt"}
 }
 
-func (s *toy) Steps(buf []Step) []Step {
-	if s.n == s.deadlockAt && s.n != 0 || s.n >= s.limit {
-		return buf
-	}
-	if s.badKind {
-		return append(buf, Step{Kind: 7})
-	}
-	if !s.twoWays {
-		return append(buf, Step{Kind: 0})
-	}
-	for _, st := range map[int]Step{0: {Kind: 0}, 1: {Kind: 1, Arg: 2}} {
-		buf = append(buf, st)
-	}
-	return buf
+// Enabled offers kind 0 alone, until the limit or the deadlock value.
+func (s *toy) Enabled(k int) bool {
+	return k == 0 && (s.n != s.deadlockAt || s.n == 0) && s.n < s.limit
 }
 
-func (s *toy) Apply(st Step) error {
-	s.n += 1 + st.Arg
+func (s *toy) Apply(k int) error {
+	s.n++
 	if s.impure != nil {
 		*s.impure++
-		s.n += *s.impure % 2
+		s.n += *s.impure % 3
 	}
 	switch s.n {
 	case s.errAt:
 		return errors.New("overflow")
-	case s.panicAt:
-		panic("toy panic")
 	case s.modeErrAt:
 		return fmt.Errorf("%w: low -> high", ErrModeChange)
 	}
 	return nil
 }
 
-func (s *toy) Key(buf []byte) []byte { return append(buf, byte(s.n)) }
+func (s *toy) World() any { return s.n }
 
 func (s *toy) Check() error {
 	if s.failAt != 0 && s.n == s.failAt {
@@ -83,17 +70,10 @@ func (s *toy) Check() error {
 	return nil
 }
 
-func (s *toy) Mode() fmt.Stringer {
-	if s.highAt != 0 && s.n >= s.highAt {
-		return toyMode("high")
-	}
-	return toyMode("low")
-}
-
 func (s *toy) Tuple() string { return fmt.Sprint(s.n) }
 func (s *toy) Settled() bool { return s.n >= s.limit || (s.settledAt != 0 && s.n == s.settledAt) }
-func (s *toy) Describe(st Step) string {
-	return fmt.Sprintf("%sstep %d+%d from %d", s.label, st.Kind, st.Arg, s.n)
+func (s *toy) Describe(k int) string {
+	return fmt.Sprintf("%sstep %d from %d", s.label, k, s.n)
 }
 
 var _ System = (*toy)(nil)
@@ -105,36 +85,32 @@ type rec struct {
 	fatal      bool
 }
 
-type fatalStop struct{}
-
 func (r *rec) Helper()                        {}
 func (r *rec) Errorf(format string, a ...any) { r.errs = append(r.errs, fmt.Sprintf(format, a...)) }
 func (r *rec) Logf(format string, a ...any)   { r.logs = append(r.logs, fmt.Sprintf(format, a...)) }
 func (r *rec) Fatalf(format string, a ...any) {
 	r.Errorf(format, a...)
 	r.fatal = true
-	panic(fatalStop{})
+	runtime.Goexit() // as testing does: stop this test's goroutine
 }
 func (r *rec) has(list []string, s string) bool { return strings.Contains(strings.Join(list, "\n"), s) }
 
+// capture runs fn against a recorder on its own goroutine, so a Fatalf
+// stops fn alone, as it would stop a test.
 func capture(t *testing.T, fn func(tb testing.TB)) *rec {
 	r := &rec{TB: t}
-	func() {
-		defer func() {
-			if v := recover(); v != nil {
-				if _, ok := v.(fatalStop); !ok {
-					panic(v)
-				}
-			}
-		}()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
 		fn(r)
 	}()
+	<-done
 	return r
 }
 
-var small = Options{MaxDepth: 50, MaxStates: 1000}
+var small = Options{MaxStates: 1000}
 
-func TestViolationKinds(t *testing.T) { // AC-21, AC-22, AC-23
+func TestViolationKinds(t *testing.T) {
 	cases := []struct {
 		name string
 		sys  *toy
@@ -145,13 +121,11 @@ func TestViolationKinds(t *testing.T) { // AC-21, AC-22, AC-23
 		{"settled by design", &toy{limit: 5, deadlockAt: 3, settledAt: 3}, kindNone, 0},
 		{"invariant", &toy{limit: 5, failAt: 4}, Invariant, 4},
 		{"apply error", &toy{limit: 5, errAt: 2}, ApplyError, 2},
-		{"undeclared kind", &toy{limit: 5, badKind: true}, ApplyError, 1},
-		{"panic", &toy{limit: 5, panicAt: 3}, Panic, 3},
 		{"mode change", &toy{limit: 5, modeErrAt: 2}, ModeChange, 2},
 		{"nondeterminism", &toy{limit: 5, impure: new(int)}, Nondeterminism, -1},
 	}
 	for _, c := range cases {
-		r := runSearch(c.sys, small)
+		r := search1(t, c.sys, small)
 		if r.Violation.Kind != c.want || (c.len >= 0 && len(r.Violation.Trace) != c.len) {
 			t.Errorf("%s: got %v with trace %v (%s), want %v of length %d",
 				c.name, r.Violation.Kind, r.Violation.Trace, r.Violation.Detail, c.want, c.len)
@@ -159,7 +133,7 @@ func TestViolationKinds(t *testing.T) { // AC-21, AC-22, AC-23
 	}
 }
 
-func TestRefusesEmptyInvariants(t *testing.T) { // AC-24
+func TestRefusesEmptyInvariants(t *testing.T) {
 	r := capture(t, func(tb testing.TB) { Explore(tb, &toy{limit: 3, noInv: true}, small) })
 	if !r.fatal || !r.has(r.errs, "Invariants() is empty") {
 		t.Errorf("Explore ran with no invariants: errs=%v", r.errs)
@@ -172,8 +146,8 @@ func TestRefusesEmptyInvariants(t *testing.T) { // AC-24
 	}
 }
 
-func TestRequireComplete(t *testing.T) { // AC-25
-	o := Options{MaxDepth: 50, MaxStates: 4, RequireComplete: true}
+func TestRequireComplete(t *testing.T) {
+	o := Options{MaxStates: 4, RequireComplete: true}
 	r := capture(t, func(tb testing.TB) { Explore(tb, &toy{limit: 10}, o) })
 	if !r.has(r.errs, "search incomplete") || !r.has(r.errs, "states=4") {
 		t.Errorf("truncation not reported: %v", r.errs)
@@ -181,123 +155,38 @@ func TestRequireComplete(t *testing.T) { // AC-25
 	o.RequireComplete = false
 	var res Result
 	r = capture(t, func(tb testing.TB) { res = Explore(tb, &toy{limit: 10}, o) })
-	if len(r.errs) != 0 || res.Complete || res.Cut == 0 {
-		t.Errorf("without RequireComplete: errs=%v complete=%t cut=%d", r.errs, res.Complete, res.Cut)
+	if len(r.errs) != 0 || res.Complete || res.States != 4 || res.Depth != 3 {
+		t.Errorf("without RequireComplete: errs=%v complete=%t states=%d depth=%d", r.errs, res.Complete, res.States, res.Depth)
 	}
 }
 
-func TestDigestStable(t *testing.T) { // AC-08
-	sys := &toy{limit: 20, highAt: 7}
-	want := runSearch(sys, small).Digest()
-	for range 100 {
-		if runSearch(sys, small).Digest() != want {
-			t.Fatal("digest changed between runs")
-		}
-	}
-	for _, p := range []int{1, 8} {
-		prev := runtime.GOMAXPROCS(p)
-		got := runSearch(sys, small).Digest()
-		runtime.GOMAXPROCS(prev)
-		if got != want {
-			t.Fatalf("digest differs at GOMAXPROCS %d", p)
-		}
-	}
-}
-
-func TestCheckDeterminism(t *testing.T) { // AC-27
-	r := capture(t, func(tb testing.TB) { CheckDeterminism(tb, &toy{limit: 30, twoWays: true}, small) })
-	if !r.has(r.errs, "differ") {
-		t.Errorf("map-ordered Steps not caught: %v", r.errs)
-	}
-	r = capture(t, func(tb testing.TB) { CheckDeterminism(tb, &toy{limit: 30}, small) })
-	if len(r.errs) != 0 {
-		t.Errorf("deterministic system flagged: %v", r.errs)
-	}
-}
-
-func TestMaskNeverDeadlocks(t *testing.T) { // AC-17
-	ok := newRunner(&toy{limit: 5}, 20)
+func TestMaskNeverDeadlocks(t *testing.T) {
+	ok := runner1(t, &toy{limit: 5}, 20)
 	for _, mask := range []byte{0, 1, 2, 3} {
-		if v := ok.run([]byte{mask, 0, 0}, nil); v.Found() {
+		if v := run1(t, ok, []byte{mask, 0, 0}); v.Found() {
 			t.Errorf("mask %02b: false %v", mask, v.Kind)
 		}
 	}
-	stuck := newRunner(&toy{limit: 5, deadlockAt: 3}, 20)
+	stuck := runner1(t, &toy{limit: 5, deadlockAt: 3}, 20)
 	for _, mask := range []byte{0, 1, 2, 3} {
-		if v := stuck.run([]byte{mask}, nil); v.Kind != Deadlock {
+		if v := run1(t, stuck, []byte{mask}); v.Kind != Deadlock {
 			t.Errorf("mask %02b: real deadlock reported as %v", mask, v.Kind)
 		}
 	}
 }
 
-func TestFuzzBytesFollowTrace(t *testing.T) { // TR-01
+func TestFuzzBytesFollowTrace(t *testing.T) {
 	sys := &toy{limit: 6, failAt: 5}
-	v := runSearch(sys, small).Violation
-	got := newRunner(sys, 20).run(v.Trace.FuzzBytes(sys), nil)
+	v := search1(t, sys, small).Violation
+	got := run1(t, runner1(t, sys, 20), bytes1(t, v.Trace, sys))
 	if got.Kind != Invariant || fmt.Sprint(got.Trace) != fmt.Sprint(v.Trace) {
 		t.Errorf("fuzz replay of %v gave %v %v", v.Trace, got.Kind, got.Trace)
 	}
 }
 
-func TestRegressions(t *testing.T) { // AC-20
-	chdir(t, t.TempDir())
-	o := small
-	o.Regressions = "toy"
-	r := capture(t, func(tb testing.TB) { Explore(tb, &toy{limit: 6, failAt: 4}, o) })
-	if !r.has(r.logs, "counterexample written") {
-		t.Fatalf("no regression written: %v %v", r.errs, r.logs)
-	}
-	if r := capture(t, func(tb testing.TB) { Regress(tb, &toy{limit: 6, failAt: 4}, "toy") }); !r.has(r.errs, "the bug is back") {
-		t.Errorf("unfixed bug passed its regression: %v", r.errs)
-	}
-	if r := capture(t, func(tb testing.TB) { Regress(tb, &toy{limit: 6}, "toy") }); len(r.errs) != 0 {
-		t.Errorf("fixed bug failed its regression: %v", r.errs)
-	}
-	if r := capture(t, func(tb testing.TB) { Regress(tb, &toy{limit: 6, label: "v2 "}, "toy") }); !r.has(r.errs, "no longer fits") {
-		t.Errorf("shifted steps not detected: %v", r.errs)
-	}
-	if r := capture(t, func(tb testing.TB) { Regress(tb, &toy{limit: 2}, "toy") }); !r.has(r.errs, "no longer fits") {
-		t.Errorf("missing step not detected: %v", r.errs)
-	}
-}
-
-func TestRegressionReadOnly(t *testing.T) { // TR-05
-	dir := t.TempDir()
-	chdir(t, dir)
-	if err := os.Mkdir("testdata", 0o555); err != nil {
-		t.Fatal(err)
-	}
-	o := small
-	o.Regressions = "toy"
-	r := capture(t, func(tb testing.TB) { Explore(tb, &toy{limit: 6, failAt: 4}, o) })
-	if os.Getuid() != 0 && !r.has(r.logs, "its contents are:\n"+traceHeader) {
-		t.Errorf("unwritable regression not logged in full: %v", r.logs)
-	}
-}
-
-func TestCoverageNamesMissingEdge(t *testing.T) { // AC-26
-	chdir(t, t.TempDir())
-	sys := &toy{limit: 6, highAt: 4}
-	explored := runSearch(sys, small)
-	r := capture(t, func(tb testing.TB) {
-		Coverage(tb, sys, "FuzzToy", explored, FuzzOptions{MaxDepth: 2},
-			CoverageMin{Modes: 100, ModeEdges: 100, Tuples: 1})
-	})
-	if !r.has(r.errs, "low -> high") {
-		t.Errorf("missing edge not named: %v", r.errs)
-	}
-	r = capture(t, func(tb testing.TB) {
-		Coverage(tb, sys, "FuzzToy", explored, FuzzOptions{MaxDepth: 20, Seeds: explored.Witnesses},
-			CoverageMin{Modes: 100, ModeEdges: 100, Tuples: 100})
-	})
-	if len(r.errs) != 0 {
-		t.Errorf("seeds alone should reach everything: %v", r.errs)
-	}
-}
-
 // pairs is a Totality over a small hand-written table of outcomes.
 type pairs struct {
-	fail map[[2]int]string // "panic", "changed", "accept-zero"
+	fail map[[2]int]string // "missing", "changed", "accept-zero"
 }
 
 func (p pairs) Machines() int { return 3 }
@@ -305,30 +194,37 @@ func (p pairs) Events() int   { return 3 }
 func (p pairs) Name(m, e int) string {
 	return fmt.Sprintf("m%d/e%d", m, e)
 }
-func (p pairs) Fire(m, e int) (quiet, unchanged bool) {
+func (p pairs) Fire(m, e int) (fsm.Outcome, bool) {
 	switch p.fail[[2]int{m, e}] {
-	case "panic":
-		panic("undeclared event")
+	case "missing":
+		return fsm.Invalid, true // a real pair the machine refuses as Invalid
+	case "unset":
+		var none fsm.Outcome // an outcome Fire never set
+		return none, true
 	case "changed":
-		return true, false
+		return fsm.Ignored, false
 	case "accept-zero":
-		return true, true
+		return fsm.Rejected, true
 	}
 	if m == 0 || e == 0 {
-		panic("zero value")
+		return fsm.Invalid, true
 	}
-	return e == 2, true
+	if e == 2 {
+		return fsm.Ignored, true
+	}
+	return fsm.Moved, false
 }
 
-func TestTotal(t *testing.T) { // AC-07, AC-18
+func TestTotal(t *testing.T) {
 	cases := []struct {
 		fail map[[2]int]string
 		want string
 	}{
 		{nil, ""},
-		{map[[2]int]string{{1, 2}: "panic"}, "m1/e2: panicked"},
-		{map[[2]int]string{{2, 2}: "changed"}, "m2/e2: Ignored or Rejected, but the machine changed"},
-		{map[[2]int]string{{0, 1}: "accept-zero"}, "m0/e1: the zero machine or zero event was accepted"},
+		{map[[2]int]string{{1, 2}: "missing"}, "m1/e2: refused as Invalid"},
+		{map[[2]int]string{{2, 1}: "unset"}, "m2/e1: refused as Invalid"},
+		{map[[2]int]string{{2, 2}: "changed"}, "m2/e2: quiet outcome (Ignored or Rejected), but the machine changed"},
+		{map[[2]int]string{{0, 1}: "accept-zero"}, "m0/e1: the zero machine or zero event was not refused"},
 	}
 	for _, c := range cases {
 		r := capture(t, func(tb testing.TB) { Total(tb, pairs{fail: c.fail}) })
@@ -338,19 +234,226 @@ func TestTotal(t *testing.T) { // AC-07, AC-18
 	}
 }
 
-// chdir changes directory for one test; the module targets Go 1.22, which
-// lacks testing.T.Chdir.
-func chdir(t *testing.T, dir string) {
-	prev, err := os.Getwd()
+// TestBadAdapterValuesAreErrors: a value from the adapter that merilo
+// cannot use is an error at every entry point, never a panic.
+func TestBadAdapterValuesAreErrors(t *testing.T) {
+	for _, k := range []int{-1, maxKinds + 1} {
+		sys := &toy{limit: 3, kinds: k}
+		if _, err := runSearch(sys, small); err == nil {
+			t.Errorf("Kinds() = %d accepted by the search", k)
+		}
+		if _, err := newRunner(sys, 3); err == nil {
+			t.Errorf("Kinds() = %d accepted by the fuzzer", k)
+		}
+		if err := Replay(sys, Trace{0}); err == nil {
+			t.Errorf("Kinds() = %d accepted by Replay", k)
+		}
+		if _, err := (Trace{0}).FuzzBytes(sys); err == nil {
+			t.Errorf("Kinds() = %d accepted by FuzzBytes", k)
+		}
+	}
+	for _, o := range []Options{{MaxStates: 0}, {MaxStates: maxStates + 1}} {
+		if _, err := runSearch(&toy{limit: 3}, o); err == nil {
+			t.Errorf("Options %+v accepted; the node table would be sized from it", o)
+		}
+	}
+	if _, err := newRunner(&toy{limit: 3}, maxDepth+1); err == nil {
+		t.Error("a fuzz depth past maxDepth was accepted")
+	}
+	if _, err := (Trace{-1}).FuzzBytes(&toy{limit: 3}); err == nil {
+		t.Error("a negative trace kind was encoded")
+	}
+	if err := Replay(&toy{limit: 3}, Trace{1}); err == nil {
+		t.Error("Replay took a kind the world does not enable")
+	}
+}
+
+func TestOneLineEscapesControls(t *testing.T) { // item 7
+	got := oneLine("a\tb\nc\rd\x1b[2Je\x00f")
+	if got != `a b c\rd\x1b[2Je\x00f` {
+		t.Errorf("oneLine = %q", got)
+	}
+}
+
+func search1(t *testing.T, sys System, o Options) Result {
+	t.Helper()
+	r, err := runSearch(sys, o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(dir); err != nil {
+	return r
+}
+
+func runner1(t *testing.T, sys System, depth int) *runner {
+	t.Helper()
+	r, err := newRunner(sys, depth)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := os.Chdir(prev); err != nil {
-			t.Fatal(err)
-		}
+	return r
+}
+
+func run1(t *testing.T, r *runner, data []byte) Violation {
+	t.Helper()
+	v, err := r.run(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func bytes1(t *testing.T, tr Trace, sys System) []byte {
+	t.Helper()
+	b, err := tr.FuzzBytes(sys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// counter is an adapter that allocates nothing itself: its world is an int
+// below 256, which Go boxes without allocating, and its strings are
+// constants. Kind 0 counts by one and kind 1, at even values, by two.
+type counter struct{ n, limit int }
+
+var counterInvariants = []string{"nothing"}
+
+func (c *counter) Reset()               { c.n = 0 }
+func (c *counter) Kinds() int           { return 2 }
+func (c *counter) Enabled(k int) bool   { return c.n < c.limit && (k == 0 || k == 1 && c.n%2 == 0) }
+func (c *counter) World() any           { return c.n }
+func (c *counter) Check() error         { return nil }
+func (c *counter) Tuple() string        { return "counting" }
+func (c *counter) Settled() bool        { return true }
+func (c *counter) Describe(int) string  { return "step" }
+func (c *counter) Invariants() []string { return counterInvariants }
+
+func (c *counter) Apply(k int) error {
+	c.n = min(c.n+1+k, c.limit)
+	return nil
+}
+
+// TestStopsWhenFull: the search stops at the first world that
+// does not fit, and Depth is the distance within which every world was
+// stored. The counter reaches 2d-1 and 2d in d steps. Four worlds hold 3,
+// two steps away, but not 4, so only depth 1 was searched in full.
+func TestStopsWhenFull(t *testing.T) {
+	r, err := runSearch(&counter{limit: 100}, Options{MaxStates: 4})
+	if err != nil || r.Complete || r.States != 4 || r.Depth != 1 {
+		t.Errorf("complete=%t states=%d depth=%d, %v; want an incomplete search of 4 worlds to depth 1", r.Complete, r.States, r.Depth, err)
+	}
+	r, err = runSearch(&counter{limit: 4}, Options{MaxStates: 5})
+	if err != nil || !r.Complete || r.States != 5 || r.Depth != 2 {
+		t.Errorf("complete=%t states=%d depth=%d, %v; want all 5 worlds, the farthest 2 steps away", r.Complete, r.States, r.Depth, err)
+	}
+}
+
+// TestSeedLongerThanFuzzDepth: a seed the fuzz depth would cut short is
+// refused, not truncated.
+func TestSeedLongerThanFuzzDepth(t *testing.T) {
+	s, err := newSearch(&toy{limit: 5}, small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.run(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.witnesses(5); err != nil {
+		t.Errorf("seeds of 5 steps refused at depth 5: %v", err)
+	}
+	if _, err := s.witnesses(4); err == nil || !strings.Contains(err.Error(), "more than FuzzOptions.MaxDepth 4") {
+		t.Errorf("a seed of 5 steps accepted at depth 4: %v", err)
+	}
+}
+
+// TestSearchAllocatesOnlyAtSetup: under the same
+// bounds, ten times as many worlds cost no more allocations, so the search
+// allocates nothing per world after newSearch.
+func TestSearchAllocatesOnlyAtSetup(t *testing.T) {
+	o := Options{MaxStates: 1000}
+	allocs := func(limit int) float64 {
+		return testing.AllocsPerRun(5, func() {
+			r, err := runSearch(&counter{limit: limit}, o)
+			if err != nil || r.States != limit+1 {
+				t.Fatalf("limit %d: %d states, %v", limit, r.States, err)
+			}
+		})
+	}
+	if small, large := allocs(20), allocs(200); small != large {
+		t.Errorf("a search of 21 worlds allocates %v times and one of 201 worlds %v times", small, large)
+	}
+}
+
+// TestFuzzInputAllocatesNothing: once newRunner
+// has run, an input allocates nothing.
+func TestFuzzInputAllocatesNothing(t *testing.T) {
+	r := runner1(t, &counter{limit: 200}, 100)
+	data := []byte{0, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0}
+	if n := testing.AllocsPerRun(100, func() { run1(t, r, data) }); n != 0 {
+		t.Errorf("a fuzz input allocates %v times", n)
+	}
+}
+
+// TestTotalAllocatesNothing: on a table that passes, it
+// allocates nothing.
+func TestTotalAllocatesNothing(t *testing.T) {
+	r := &rec{TB: t}
+	if n := testing.AllocsPerRun(10, func() { Total(r, pairs{}) }); n != 0 || len(r.errs) != 0 {
+		t.Errorf("Total allocates %v times; errors %v", n, r.errs)
+	}
+}
+
+// reentrant is a toy whose Apply calls back into merilo, which merilo
+// itself is running: recursion through adapter code (Rule 1).
+type reentrant struct {
+	toy
+	via string // "replay" or "explore"
+	tb  testing.TB
+}
+
+func (s *reentrant) Apply(k int) error {
+	if err := s.toy.Apply(k); err != nil {
+		return err
+	}
+	inner := &toy{limit: 2}
+	switch s.via {
+	case "replay":
+		return Replay(inner, Trace{0})
+	case "explore":
+		Explore(s.tb, inner, small)
+	}
+	return nil
+}
+
+// reentrantTable is a Totality whose Fire calls Total.
+type reentrantTable struct {
+	pairs
+	tb testing.TB
+}
+
+func (p reentrantTable) Fire(m, e int) (fsm.Outcome, bool) {
+	Total(p.tb, pairs{})
+	return p.pairs.Fire(m, e)
+}
+
+// TestReentryRefused: an adapter that calls merilo from inside a run is
+// refused, not followed, whichever entry point it calls back into. The
+// same calls made from the test itself are not re-entry.
+func TestReentryRefused(t *testing.T) {
+	if err := Replay(&reentrant{toy: toy{limit: 3}, via: "replay"}, Trace{0}); err == nil || !strings.Contains(err.Error(), "called again from inside a run") {
+		t.Errorf("Replay re-entered from Apply: err = %v", err)
+	}
+	r := capture(t, func(tb testing.TB) {
+		Explore(tb, &reentrant{toy: toy{limit: 3}, via: "explore", tb: tb}, small)
 	})
+	if !r.has(r.errs, "called again from inside a run") {
+		t.Errorf("Explore re-entered from Apply: errs = %v", r.errs)
+	}
+	r = capture(t, func(tb testing.TB) { Total(tb, reentrantTable{tb: tb}) })
+	if !r.has(r.errs, "called again from inside a run") {
+		t.Errorf("Total re-entered from Fire: errs = %v", r.errs)
+	}
+	if err := Replay(&toy{limit: 3}, Trace{0, 0}); err != nil {
+		t.Errorf("a plain Replay from a test: %v", err)
+	}
 }

@@ -2,69 +2,96 @@ package merilo
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"strings"
 	"testing"
 )
 
 // FuzzOptions bounds a fuzz run. MaxDepth has no default.
 type FuzzOptions struct {
 	MaxDepth int     // steps per input, drain included
-	Seeds    []Trace // witness schedules, usually Result.Witnesses
+	Explore  Options // when set, a search with this bound runs first, as Explore does, and seeds the fuzzer
 }
 
 // Fuzz turns sys into a native Go fuzz target. Each input decodes into a
-// schedule (FZ-01 to FZ-04); a violation fails with the readable trace.
+// schedule; a violation fails with the readable trace.
+// With Explore set, the shortest schedule to each tuple the search reaches
+// seeds the fuzzer, so fuzzing starts at the edge of the exhaustive search.
 func Fuzz(f *testing.F, sys System, o FuzzOptions) {
+	if f == nil {
+		return
+	}
 	f.Helper()
-	if err := validateFuzz(sys, o); err != nil {
+	if sys == nil {
+		f.Fatalf("merilo: nil System")
+	}
+	r, err := newRunner(sys, o.MaxDepth)
+	if err != nil {
 		f.Fatalf("%v", err)
 	}
-	for _, s := range o.Seeds {
-		assert(len(s) <= o.MaxDepth, "seed longer than MaxDepth")
-		f.Add(s.FuzzBytes(sys))
+	if seeded := o.Explore != (Options{}); seeded && !seed(f, sys, o) {
+		return
 	}
-	r := newRunner(sys, o.MaxDepth)
-	assert(r.d.kinds == sys.Kinds(), "runner kinds differ from the System")
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if v := r.run(data, nil); v.Found() {
-			report(t, sys, "", v)
+		v, err := r.run(data)
+		if err != nil {
+			t.Fatalf("%v", err)
+		}
+		if v.Found() {
+			report(t, sys, v)
 		}
 	})
 }
 
-func validateFuzz(sys System, o FuzzOptions) error {
-	switch {
-	case sys == nil:
-		return fmt.Errorf("merilo: nil System")
-	case o.MaxDepth <= 0:
-		return fmt.Errorf("merilo: FuzzOptions.MaxDepth must be set; it has no default")
-	case sys.Kinds() <= 0:
-		return fmt.Errorf("merilo: Kinds() must be positive")
+// seed runs the search o.Explore bounds and adds its witnesses to f. It
+// reports false when the search failed f, so there is nothing to fuzz.
+func seed(f *testing.F, sys System, o FuzzOptions) bool {
+	if f == nil || sys == nil {
+		return false
 	}
-	assert(o.MaxDepth > 0, "validated MaxDepth out of range")
-	return nil
+	res, s := explore(f, sys, o.Explore)
+	if s == nil || res.Violation.Found() {
+		return false
+	}
+	seeds, err := s.witnesses(o.MaxDepth)
+	if err != nil {
+		f.Fatalf("%v", err)
+	}
+	for _, b := range seeds {
+		f.Add(b)
+	}
+	return true
 }
 
 // runner decodes fuzz inputs into schedules and runs them.
 type runner struct {
-	d        *driver
+	d        driver
 	maxDepth int
-	trace    Trace
+	trace    Trace // the input's schedule so far, MaxDepth steps at most
+	viol     Trace // a violation's trace, valid until the next input
 	pos      int
 	drain    bool
 }
 
-func newRunner(sys System, maxDepth int) *runner {
-	assert(maxDepth > 0, "runner without MaxDepth")
-	assert(sys != nil, "runner without System")
-	return &runner{d: newDriver(sys), maxDepth: maxDepth}
+func newRunner(sys System, depth int) (*runner, error) {
+	if sys == nil {
+		return nil, errors.New("merilo: nil System")
+	}
+	if depth <= 0 || depth > maxDepth {
+		return nil, fmt.Errorf("merilo: FuzzOptions.MaxDepth is %d; it must be set, from 1 to %d, and has no default", depth, maxDepth)
+	}
+	d, err := newDriver(sys)
+	if err != nil {
+		return nil, err
+	}
+	return &runner{d: d, maxDepth: depth, trace: make(Trace, 0, depth), viol: make(Trace, 0, depth)}, nil
 }
 
-// run executes one input, reporting what it reached to obs when obs is
-// not nil, and returns the first violation.
-func (r *runner) run(data []byte, obs *observer) Violation {
-	assert(r.maxDepth > 0, "runner without MaxDepth")
+// run executes one input and returns the first violation.
+func (r *runner) run(data []byte) (Violation, error) {
+	if r == nil {
+		return Violation{}, fault("run without a runner")
+	}
 	maskLen := (r.d.kinds + 7) / 8
 	if maskLen > len(data) {
 		maskLen = len(data)
@@ -73,131 +100,99 @@ func (r *runner) run(data []byte, obs *observer) Violation {
 	r.trace, r.pos, r.drain = r.trace[:0], maskLen, false
 	r.d.sys.Reset()
 	if a := r.d.check(); a.kind != kindNone {
-		return r.violation(a)
+		return Violation{Kind: a.kind, Trace: Trace{}, Detail: a.detail}, nil
 	}
-	obs.see(r.d.sys)
-	for depth := 0; depth < r.maxDepth; depth++ {
-		steps := r.d.enabled()
-		p := -1
-		if !r.drain {
-			p = r.choose(steps, data, mask)
+	maxDepth := r.maxDepth
+	for depth := 0; depth < maxDepth; depth++ {
+		k, err := r.choose(data, mask)
+		if err != nil {
+			return Violation{}, err
 		}
-		if r.drain {
-			if len(steps) == 0 {
-				return r.settledOrDeadlock()
-			}
-			p = 0
+		if k < 0 {
+			return r.settledOrDeadlock(), nil
 		}
-		assert(p >= 0 && p < len(steps), "chosen position outside the enabled steps")
-		if a := r.step(steps[p], p, obs); a.kind != kindNone {
-			return r.violation(a)
+		r.trace = append(r.trace, k)
+		a := r.d.apply(k)
+		if a.kind == kindNone {
+			a = r.d.check()
+		}
+		if a.kind != kindNone {
+			return Violation{Kind: a.kind, Trace: append(r.viol[:0], r.trace...), Detail: a.detail}, nil
 		}
 	}
-	assert(len(r.trace) == r.maxDepth, "run ended early without a verdict")
-	return Violation{}
+	return Violation{}, nil
 }
 
-// step applies one chosen step and checks invariants after it.
-func (r *runner) step(s Step, p int, obs *observer) applied {
-	assert(p >= 0, "no step chosen")
-	from := obs.mode(r.d.sys)
-	r.trace = append(r.trace, p)
-	assert(len(r.trace) <= r.maxDepth, "trace longer than MaxDepth")
-	a := r.d.apply(s)
-	if a.kind == kindNone {
-		a = r.d.check()
+// choose takes the kind the input names. When the bytes or the
+// enabled, unmasked kinds run out it drains: the lowest enabled kind, mask
+// or not. It returns -1 when no kind is enabled.
+func (r *runner) choose(data, mask []byte) (int, error) {
+	if r == nil {
+		return -1, fault("choose without a runner")
 	}
-	if a.kind == kindNone {
-		obs.see(r.d.sys)
-		obs.edge(from, obs.mode(r.d.sys))
-	}
-	return a
-}
-
-// choose reads the next varint and picks among the unmasked enabled steps
-// (FZ-02). It switches to draining when bytes or unmasked steps run out.
-func (r *runner) choose(steps []Step, data, mask []byte) int {
-	assert(r.pos <= len(data), "read position past the input")
-	v, n := binary.Uvarint(data[r.pos:])
-	unmasked := 0
-	for _, s := range steps {
-		if !masked(mask, s.Kind) {
-			unmasked++
+	if !r.drain {
+		k, err := r.named(data, mask)
+		if err != nil || k >= 0 {
+			return k, err
 		}
-	}
-	if n <= 0 || unmasked == 0 {
 		r.drain = true
-		return -1
+	}
+	kinds := r.d.kinds
+	for k := 0; k < kinds; k++ {
+		if r.d.enabled(k) {
+			return k, nil
+		}
+	}
+	return -1, nil
+}
+
+// named reads the next varint v and returns the first enabled, unmasked
+// kind from v mod Kinds() on, wrapping round, or -1 when the bytes or such
+// kinds have run out.
+func (r *runner) named(data, mask []byte) (int, error) {
+	if r == nil {
+		return -1, fault("named without a runner")
+	}
+	if r.pos > len(data) {
+		return -1, fault("read position %d past the %d-byte input", r.pos, len(data))
+	}
+	kinds := r.d.kinds
+	if kinds <= 0 || kinds > maxKinds {
+		return -1, fault("choose with %d step kinds", kinds)
+	}
+	v, n := binary.Uvarint(data[r.pos:])
+	if n <= 0 {
+		return -1, nil
 	}
 	r.pos += n
-	assert(r.pos <= len(data), "read past the input")
-	want := int(v % uint64(unmasked))
-	for i, s := range steps {
-		if masked(mask, s.Kind) {
-			continue
-		}
-		if want == 0 {
-			return i
-		}
-		want--
+	m := v % uint64(kinds)
+	if m >= maxKinds {
+		return -1, fault("chosen kind %d is not below %d", m, maxKinds)
 	}
-	panic("merilo: chosen step not found among unmasked steps")
+	start := int(m)
+	for j := 0; j < kinds; j++ {
+		if k := (start + j) % kinds; !masked(mask, k) && r.d.enabled(k) {
+			return k, nil
+		}
+	}
+	return -1, nil
 }
 
-func masked(mask []byte, k Kind) bool {
-	i := int(k) / 8
-	assert(i >= 0, "negative mask index")
-	assert(len(mask) <= 1<<13, "mask longer than 2^16 kinds need")
+func masked(mask []byte, k int) bool {
+	if k < 0 {
+		return true
+	}
+	i := k / 8
 	return i < len(mask) && mask[i]&(1<<(k%8)) != 0
 }
 
-// settledOrDeadlock judges a drain that ended with no enabled step (FZ-03).
+// settledOrDeadlock judges an input that ended with no enabled kind.
 func (r *runner) settledOrDeadlock() Violation {
-	assert(len(r.d.enabled()) == 0, "deadlock check with steps enabled")
-	assert(r.drain, "deadlock check outside the drain")
-	if r.d.sys.Settled() {
-		return Violation{}
+	if r == nil || r.d.sys == nil {
+		return Violation{Kind: ApplyError, Detail: "internal error: drain without a System"}
 	}
-	return r.violation(applied{kind: Deadlock, detail: "no step is enabled and Settled() is false"})
-}
-
-func (r *runner) violation(a applied) Violation {
-	assert(a.kind != kindNone, "violation without a kind")
-	assert(len(r.trace) <= r.maxDepth, "trace longer than MaxDepth")
-	return Violation{Kind: a.kind, Trace: append(Trace(nil), r.trace...), Detail: a.detail}
-}
-
-// observer records what runs reached, for Coverage. A nil observer
-// records nothing.
-type observer struct {
-	tuples map[string]bool
-	modes  map[string]bool
-	edges  map[[2]string]bool
-}
-
-func (o *observer) see(sys System) {
-	if o == nil {
-		return
+	if settled := r.d.sys.Settled(); !settled {
+		return Violation{Kind: Deadlock, Trace: append(r.viol[:0], r.trace...), Detail: "no step is enabled and Settled() is false"}
 	}
-	assert(sys != nil, "see a nil System")
-	assert(o.tuples != nil && o.modes != nil, "observer without sets")
-	o.tuples[sys.Tuple()] = true
-	o.modes[sys.Mode().String()] = true
-}
-
-func (o *observer) mode(sys System) string {
-	if o == nil {
-		return ""
-	}
-	assert(sys != nil, "mode of a nil System")
-	return sys.Mode().String()
-}
-
-func (o *observer) edge(from, to string) {
-	if o == nil || from == to {
-		return
-	}
-	assert(!strings.Contains(from+to, "\x00"), "mode name holds a NUL byte")
-	assert(o.edges != nil, "observer without edges")
-	o.edges[[2]string{from, to}] = true
+	return Violation{}
 }

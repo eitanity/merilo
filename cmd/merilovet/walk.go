@@ -22,8 +22,14 @@ type pending struct {
 }
 
 // flatten lists every node of f in pre-order, using an explicit stack.
-func flatten(f *ast.File) []entry {
-	assert(f != nil, "flatten needs a file")
+func flatten(flt *faults, f *ast.File) []entry {
+	if flt == nil {
+		return nil
+	}
+	if f == nil {
+		flt.fault("flatten needs a file")
+		return nil
+	}
 	entries := make([]entry, 0, 256)
 	stack := []pending{{node: f, parent: -1}}
 	var kids []ast.Node
@@ -39,19 +45,28 @@ func flatten(f *ast.File) []entry {
 			fn = idx
 		}
 		entries = append(entries, entry{node: top.node, parent: top.parent, fn: fn, depth: top.depth})
-		kids = children(top.node, kids[:0])
+		kids = children(flt, top.node, kids[:0])
 		for k := len(kids) - 1; k >= 0; k-- {
 			stack = append(stack, pending{node: kids[k], parent: idx, depth: top.depth + 1})
 		}
 	}
-	assert(len(stack) == 0, "file has more than maxNodes nodes")
-	closeEnds(entries)
+	if len(stack) != 0 {
+		flt.fault("file has more than maxNodes nodes")
+		return nil
+	}
+	closeEnds(flt, entries)
 	return entries
 }
 
 // closeEnds sets each entry's end from the depths of the pre-order list.
-func closeEnds(entries []entry) {
-	assert(len(entries) > 0, "closeEnds needs entries")
+func closeEnds(flt *faults, entries []entry) {
+	if flt == nil {
+		return
+	}
+	if len(entries) == 0 {
+		flt.fault("closeEnds needs entries")
+		return
+	}
 	open := make([]int, 0, 64)
 	for j := range entries {
 		for k := len(open) - 1; k >= 0; k-- {
@@ -66,84 +81,114 @@ func closeEnds(entries []entry) {
 	for _, k := range open {
 		entries[k].end = len(entries)
 	}
-	assert(entries[0].end == len(entries), "the file entry must span every node")
+	if entries[0].end != len(entries) {
+		flt.fault("the file entry must span every node")
+		return
+	}
 }
 
 // children appends n's direct children to buf in source order, except that
 // an assignment lists its right-hand side first, the order it is evaluated.
-func children(n ast.Node, buf []ast.Node) []ast.Node {
-	assert(n != nil, "children of a nil node")
-	if out, ok := exprChildren(n, buf); ok {
+func children(flt *faults, n ast.Node, buf []ast.Node) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if n == nil {
+		flt.fault("children of a nil node")
+		return nil
+	}
+	if out, ok := exprChildren(flt, n, buf); ok {
 		return out
 	}
-	if out, ok := typeChildren(n, buf); ok {
+	if out, ok := typeChildren(flt, n, buf); ok {
 		return out
 	}
-	if out, ok := stmtChildren(n, buf); ok {
+	if out, ok := stmtChildren(flt, n, buf); ok {
 		return out
 	}
-	if out, ok := flowChildren(n, buf); ok {
+	if out, ok := flowChildren(flt, n, buf); ok {
 		return out
 	}
-	out, ok := declChildren(n, buf)
-	assert(ok, "unknown syntax node")
+	out, ok := declChildren(flt, n, buf)
+	if !ok {
+		flt.fault("unknown syntax node")
+		return nil
+	}
 	return out
 }
 
-func exprChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
-	assert(n != nil, "exprChildren of a nil node")
-	assert(len(buf) == 0, "child buffer must start empty")
+func exprChildren(flt *faults, n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
+	if flt == nil {
+		return nil, false
+	}
+	if n == nil {
+		flt.fault("exprChildren of a nil node")
+		return nil, false
+	}
+	if len(buf) != 0 {
+		flt.fault("child buffer must start empty")
+		return nil, false
+	}
 	switch x := n.(type) {
 	case *ast.Ellipsis:
-		return addExpr(buf, x.Elt), true
+		return addExpr(flt, buf, x.Elt), true
 	case *ast.FuncLit:
-		return addBlock(addFuncType(buf, x.Type), x.Body), true
+		return addBlock(flt, addFuncType(flt, buf, x.Type), x.Body), true
 	case *ast.CompositeLit:
-		return addExprs(addExpr(buf, x.Type), x.Elts), true
+		return addExprs(flt, addExpr(flt, buf, x.Type), x.Elts), true
 	case *ast.ParenExpr:
-		return addExpr(buf, x.X), true
+		return addExpr(flt, buf, x.X), true
 	case *ast.SelectorExpr:
-		return addIdent(addExpr(buf, x.X), x.Sel), true
+		return addIdent(flt, addExpr(flt, buf, x.X), x.Sel), true
 	case *ast.IndexExpr:
-		return addExpr(addExpr(buf, x.X), x.Index), true
+		return addExpr(flt, addExpr(flt, buf, x.X), x.Index), true
 	case *ast.IndexListExpr:
-		return addExprs(addExpr(buf, x.X), x.Indices), true
+		return addExprs(flt, addExpr(flt, buf, x.X), x.Indices), true
 	case *ast.SliceExpr:
-		return addExpr(addExpr(addExpr(addExpr(buf, x.X), x.Low), x.High), x.Max), true
+		return addExpr(flt, addExpr(flt, addExpr(flt, addExpr(flt, buf, x.X), x.Low), x.High), x.Max), true
 	case *ast.TypeAssertExpr:
-		return addExpr(addExpr(buf, x.X), x.Type), true
+		return addExpr(flt, addExpr(flt, buf, x.X), x.Type), true
 	case *ast.CallExpr:
-		return addExprs(addExpr(buf, x.Fun), x.Args), true
+		return addExprs(flt, addExpr(flt, buf, x.Fun), x.Args), true
 	case *ast.StarExpr:
-		return addExpr(buf, x.X), true
+		return addExpr(flt, buf, x.X), true
 	case *ast.UnaryExpr:
-		return addExpr(buf, x.X), true
+		return addExpr(flt, buf, x.X), true
 	case *ast.BinaryExpr:
-		return addExpr(addExpr(buf, x.X), x.Y), true
+		return addExpr(flt, addExpr(flt, buf, x.X), x.Y), true
 	case *ast.KeyValueExpr:
-		return addExpr(addExpr(buf, x.Key), x.Value), true
+		return addExpr(flt, addExpr(flt, buf, x.Key), x.Value), true
 	}
 	return buf, false
 }
 
-func typeChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
-	assert(n != nil, "typeChildren of a nil node")
-	assert(len(buf) == 0, "child buffer must start empty")
+func typeChildren(flt *faults, n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
+	if flt == nil {
+		return nil, false
+	}
+	if n == nil {
+		flt.fault("typeChildren of a nil node")
+		return nil, false
+	}
+	if len(buf) != 0 {
+		flt.fault("child buffer must start empty")
+		return nil, false
+	}
 	switch x := n.(type) {
 	case *ast.ArrayType:
-		return addExpr(addExpr(buf, x.Len), x.Elt), true
+		return addExpr(flt, addExpr(flt, buf, x.Len), x.Elt), true
 	case *ast.StructType:
-		return addFields(buf, x.Fields), true
+		return addFields(flt, buf, x.Fields), true
 	case *ast.FuncType:
-		return addFields(addFields(addFields(buf, x.TypeParams), x.Params), x.Results), true
+		return addFields(flt, addFields(flt, addFields(flt, buf, x.TypeParams), x.Params), x.Results), true
 	case *ast.InterfaceType:
-		return addFields(buf, x.Methods), true
+		return addFields(flt, buf, x.Methods), true
 	case *ast.MapType:
-		return addExpr(addExpr(buf, x.Key), x.Value), true
+		return addExpr(flt, addExpr(flt, buf, x.Key), x.Value), true
 	case *ast.ChanType:
-		return addExpr(buf, x.Value), true
+		return addExpr(flt, buf, x.Value), true
 	case *ast.Field:
-		return addLit(addExpr(addIdents(buf, x.Names), x.Type), x.Tag), true
+		return addLit(flt, addExpr(flt, addIdents(flt, buf, x.Names), x.Type), x.Tag), true
 	case *ast.FieldList:
 		for _, f := range x.List {
 			buf = append(buf, f)
@@ -153,66 +198,93 @@ func typeChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
 	return buf, false
 }
 
-func stmtChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
-	assert(n != nil, "stmtChildren of a nil node")
-	assert(len(buf) == 0, "child buffer must start empty")
+func stmtChildren(flt *faults, n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
+	if flt == nil {
+		return nil, false
+	}
+	if n == nil {
+		flt.fault("stmtChildren of a nil node")
+		return nil, false
+	}
+	if len(buf) != 0 {
+		flt.fault("child buffer must start empty")
+		return nil, false
+	}
 	switch x := n.(type) {
 	case *ast.DeclStmt:
 		return append(buf, x.Decl), true
 	case *ast.LabeledStmt:
-		return addStmt(addIdent(buf, x.Label), x.Stmt), true
+		return addStmt(flt, addIdent(flt, buf, x.Label), x.Stmt), true
 	case *ast.ExprStmt:
-		return addExpr(buf, x.X), true
+		return addExpr(flt, buf, x.X), true
 	case *ast.SendStmt:
-		return addExpr(addExpr(buf, x.Chan), x.Value), true
+		return addExpr(flt, addExpr(flt, buf, x.Chan), x.Value), true
 	case *ast.IncDecStmt:
-		return addExpr(buf, x.X), true
+		return addExpr(flt, buf, x.X), true
 	case *ast.AssignStmt:
-		return addExprs(addExprs(buf, x.Rhs), x.Lhs), true
+		return addExprs(flt, addExprs(flt, buf, x.Rhs), x.Lhs), true
 	case *ast.GoStmt:
-		return addCall(buf, x.Call), true
+		return addCall(flt, buf, x.Call), true
 	case *ast.DeferStmt:
-		return addCall(buf, x.Call), true
+		return addCall(flt, buf, x.Call), true
 	case *ast.ReturnStmt:
-		return addExprs(buf, x.Results), true
+		return addExprs(flt, buf, x.Results), true
 	case *ast.BranchStmt:
-		return addIdent(buf, x.Label), true
+		return addIdent(flt, buf, x.Label), true
 	case *ast.BlockStmt:
-		return addStmts(buf, x.List), true
+		return addStmts(flt, buf, x.List), true
 	}
 	return buf, false
 }
 
-func flowChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
-	assert(n != nil, "flowChildren of a nil node")
-	assert(len(buf) == 0, "child buffer must start empty")
+func flowChildren(flt *faults, n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
+	if flt == nil {
+		return nil, false
+	}
+	if n == nil {
+		flt.fault("flowChildren of a nil node")
+		return nil, false
+	}
+	if len(buf) != 0 {
+		flt.fault("child buffer must start empty")
+		return nil, false
+	}
 	switch x := n.(type) {
 	case *ast.IfStmt:
-		return addStmt(addBlock(addExpr(addStmt(buf, x.Init), x.Cond), x.Body), x.Else), true
+		return addStmt(flt, addBlock(flt, addExpr(flt, addStmt(flt, buf, x.Init), x.Cond), x.Body), x.Else), true
 	case *ast.CaseClause:
-		return addStmts(addExprs(buf, x.List), x.Body), true
+		return addStmts(flt, addExprs(flt, buf, x.List), x.Body), true
 	case *ast.SwitchStmt:
-		return addBlock(addExpr(addStmt(buf, x.Init), x.Tag), x.Body), true
+		return addBlock(flt, addExpr(flt, addStmt(flt, buf, x.Init), x.Tag), x.Body), true
 	case *ast.TypeSwitchStmt:
-		return addBlock(addStmt(addStmt(buf, x.Init), x.Assign), x.Body), true
+		return addBlock(flt, addStmt(flt, addStmt(flt, buf, x.Init), x.Assign), x.Body), true
 	case *ast.CommClause:
-		return addStmts(addStmt(buf, x.Comm), x.Body), true
+		return addStmts(flt, addStmt(flt, buf, x.Comm), x.Body), true
 	case *ast.SelectStmt:
-		return addBlock(buf, x.Body), true
+		return addBlock(flt, buf, x.Body), true
 	case *ast.ForStmt:
-		return addBlock(addStmt(addExpr(addStmt(buf, x.Init), x.Cond), x.Post), x.Body), true
+		return addBlock(flt, addStmt(flt, addExpr(flt, addStmt(flt, buf, x.Init), x.Cond), x.Post), x.Body), true
 	case *ast.RangeStmt:
-		return addBlock(addExpr(addExpr(addExpr(buf, x.X), x.Key), x.Value), x.Body), true
+		return addBlock(flt, addExpr(flt, addExpr(flt, addExpr(flt, buf, x.X), x.Key), x.Value), x.Body), true
 	}
 	return buf, false
 }
 
-func declChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
-	assert(n != nil, "declChildren of a nil node")
-	assert(len(buf) == 0, "child buffer must start empty")
+func declChildren(flt *faults, n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
+	if flt == nil {
+		return nil, false
+	}
+	if n == nil {
+		flt.fault("declChildren of a nil node")
+		return nil, false
+	}
+	if len(buf) != 0 {
+		flt.fault("child buffer must start empty")
+		return nil, false
+	}
 	switch x := n.(type) {
 	case *ast.File:
-		buf = addIdent(buf, x.Name)
+		buf = addIdent(flt, buf, x.Name)
 		for _, d := range x.Decls {
 			buf = append(buf, d)
 		}
@@ -223,13 +295,13 @@ func declChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
 		}
 		return buf, true
 	case *ast.ImportSpec:
-		return addLit(addIdent(buf, x.Name), x.Path), true
+		return addLit(flt, addIdent(flt, buf, x.Name), x.Path), true
 	case *ast.ValueSpec:
-		return addExprs(addExpr(addIdents(buf, x.Names), x.Type), x.Values), true
+		return addExprs(flt, addExpr(flt, addIdents(flt, buf, x.Names), x.Type), x.Values), true
 	case *ast.TypeSpec:
-		return addExpr(addFields(addIdent(buf, x.Name), x.TypeParams), x.Type), true
+		return addExpr(flt, addFields(flt, addIdent(flt, buf, x.Name), x.TypeParams), x.Type), true
 	case *ast.FuncDecl:
-		return addBlock(addFuncType(addIdent(addFields(buf, x.Recv), x.Name), x.Type), x.Body), true
+		return addBlock(flt, addFuncType(flt, addIdent(flt, addFields(flt, buf, x.Recv), x.Name), x.Type), x.Body), true
 	case *ast.Ident, *ast.BasicLit, *ast.BadExpr, *ast.BadStmt, *ast.BadDecl, *ast.EmptyStmt:
 		return buf, true
 	}
@@ -240,98 +312,197 @@ func declChildren(n ast.Node, buf []ast.Node) ([]ast.Node, bool) {
 // pointer fields need their own helper, because a nil *ast.Ident stored in
 // an ast.Node is not a nil interface.
 
-func addExpr(buf []ast.Node, e ast.Expr) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(e), "a child is added once")
+func addExpr(flt *faults, buf []ast.Node, e ast.Expr) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(e) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if e != nil {
 		buf = append(buf, e)
 	}
 	return buf
 }
 
-func addExprs(buf []ast.Node, es []ast.Expr) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
+func addExprs(flt *faults, buf []ast.Node, es []ast.Expr) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
 	for _, e := range es {
-		assert(e != nil, "expression lists hold no nil entries")
+		if e == nil {
+			flt.fault("expression lists hold no nil entries")
+			return nil
+		}
 		buf = append(buf, e)
 	}
 	return buf
 }
 
-func addStmt(buf []ast.Node, s ast.Stmt) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(s), "a child is added once")
+func addStmt(flt *faults, buf []ast.Node, s ast.Stmt) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(s) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if s != nil {
 		buf = append(buf, s)
 	}
 	return buf
 }
 
-func addStmts(buf []ast.Node, ss []ast.Stmt) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
+func addStmts(flt *faults, buf []ast.Node, ss []ast.Stmt) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
 	for _, s := range ss {
-		assert(s != nil, "statement lists hold no nil entries")
+		if s == nil {
+			flt.fault("statement lists hold no nil entries")
+			return nil
+		}
 		buf = append(buf, s)
 	}
 	return buf
 }
 
-func addIdent(buf []ast.Node, id *ast.Ident) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(id), "a child is added once")
+func addIdent(flt *faults, buf []ast.Node, id *ast.Ident) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(id) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if id != nil {
 		buf = append(buf, id)
 	}
 	return buf
 }
 
-func addIdents(buf []ast.Node, ids []*ast.Ident) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
+func addIdents(flt *faults, buf []ast.Node, ids []*ast.Ident) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
 	for _, id := range ids {
-		assert(id != nil, "identifier lists hold no nil entries")
+		if id == nil {
+			flt.fault("identifier lists hold no nil entries")
+			return nil
+		}
 		buf = append(buf, id)
 	}
 	return buf
 }
 
-func addBlock(buf []ast.Node, b *ast.BlockStmt) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(b), "a child is added once")
+func addBlock(flt *faults, buf []ast.Node, b *ast.BlockStmt) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(b) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if b != nil {
 		buf = append(buf, b)
 	}
 	return buf
 }
 
-func addFields(buf []ast.Node, fl *ast.FieldList) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(fl), "a child is added once")
+func addFields(flt *faults, buf []ast.Node, fl *ast.FieldList) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(fl) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if fl != nil {
 		buf = append(buf, fl)
 	}
 	return buf
 }
 
-func addFuncType(buf []ast.Node, ft *ast.FuncType) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(ft), "a child is added once")
+func addFuncType(flt *faults, buf []ast.Node, ft *ast.FuncType) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(ft) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if ft != nil {
 		buf = append(buf, ft)
 	}
 	return buf
 }
 
-func addLit(buf []ast.Node, lit *ast.BasicLit) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(len(buf) == 0 || buf[len(buf)-1] != ast.Node(lit), "a child is added once")
+func addLit(flt *faults, buf []ast.Node, lit *ast.BasicLit) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if len(buf) != 0 && buf[len(buf)-1] == ast.Node(lit) {
+		flt.fault("a child is added once")
+		return nil
+	}
 	if lit != nil {
 		buf = append(buf, lit)
 	}
 	return buf
 }
 
-func addCall(buf []ast.Node, call *ast.CallExpr) []ast.Node {
-	assert(len(buf) < maxNodes, "child buffer overflow")
-	assert(call != nil, "go and defer statements always hold a call")
+func addCall(flt *faults, buf []ast.Node, call *ast.CallExpr) []ast.Node {
+	if flt == nil {
+		return nil
+	}
+	if len(buf) >= maxNodes {
+		flt.fault("child buffer overflow")
+		return nil
+	}
+	if call == nil {
+		flt.fault("go and defer statements always hold a call")
+		return nil
+	}
 	return append(buf, call)
 }

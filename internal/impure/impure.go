@@ -1,13 +1,14 @@
-// Package impure is an acceptance-test fixture (AC-15): a machine whose
+// Package impure is an acceptance-test fixture: a machine whose
 // Fire consults a helper package's hidden state, so replaying the same
 // path can reach a different world.
 package impure
 
-import "github.com/eitanity/merilo/internal/impure/clock"
+import "code.eitanity.com/merilo/internal/impure/clock"
 
 // State is the control state.
 type State uint8
 
+// State values.
 const (
 	stateNone State = iota
 	Even
@@ -17,6 +18,7 @@ const (
 // Event is an input to Fire.
 type Event uint8
 
+// Event values.
 const (
 	eventNone Event = iota
 	EvStep
@@ -25,6 +27,7 @@ const (
 // Mode is derived from State.
 type Mode uint8
 
+// Mode values.
 const (
 	modeNone Mode = iota
 	Normal
@@ -33,9 +36,11 @@ const (
 // Outcome reports what Fire did.
 type Outcome uint8
 
+// Outcome values.
 const (
 	outcomeNone Outcome = iota
 	Moved
+	Invalid // an impossible state, event or transition, refused with the machine unchanged
 )
 
 // Actions is always empty.
@@ -56,12 +61,9 @@ func (m Machine) Mode() Mode {
 	case Even, Odd:
 		return Normal
 	default:
-		panic("impure: invalid state")
+		return modeNone
 	}
 }
-
-// AppendKey appends every field.
-func (m Machine) AppendKey(b []byte) []byte { return append(b, byte(m.state)) }
 
 // Fire reads the clock: the impurity under test.
 func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
@@ -74,6 +76,6 @@ func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
 		}
 		return m, Actions{}, Moved
 	default:
-		panic("impure: invalid event")
+		return m, Actions{}, Invalid
 	}
 }

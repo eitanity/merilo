@@ -10,61 +10,68 @@ import (
 	"os"
 	"time"
 
-	"github.com/eitanity/merilo/examples/order"
+	"code.eitanity.com/merilo/examples/order"
+	"code.eitanity.com/merilo/fsm"
 )
 
 const timeout = 2 * time.Second
 
-// expiry is a timer firing, tagged with the generation it was started in.
-type expiry struct{ gen uint64 }
+// maxLine is the longest command line accepted. A longer one is an error,
+// not the end of input.
+const maxLine = 4096
 
 // client holds one order and the real timer its actions ask for.
 type client struct {
 	m      order.Machine
 	timer  *time.Timer
-	gen    uint64
-	expire chan expiry
+	expire chan struct{} // the timer expired
+	quit   chan struct{} // closed when the owner loop stops, releasing every sender
 }
 
 func main() {
-	c := &client{m: order.New(), expire: make(chan expiry, 1)}
+	c := &client{m: order.New(), expire: make(chan struct{}, 1), quit: make(chan struct{})}
 	lines := make(chan string)
-	go read(lines)
-	if err := c.loop(lines); err != nil {
+	readErr := make(chan error, 1)
+	go read(lines, readErr, c.quit)
+	err := c.loop(lines, readErr)
+	close(c.quit)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "orderd:", err)
 		os.Exit(1)
 	}
 }
 
-func read(lines chan<- string) {
+// read sends each input line until input ends, a line is too long, or the
+// owner loop stops. Its error, nil at a clean end, is sent before lines is
+// closed.
+func read(lines chan<- string, readErr chan<- error, quit <-chan struct{}) {
 	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 256), maxLine)
 	for sc.Scan() {
-		lines <- sc.Text()
+		select {
+		case lines <- sc.Text():
+		case <-quit:
+			return
+		}
 	}
+	readErr <- sc.Err()
 	close(lines)
 }
 
 // loop is the owner loop: the only goroutine that touches the machine.
-func (c *client) loop(lines <-chan string) error {
+func (c *client) loop(lines <-chan string, readErr <-chan error) error {
 	for {
 		select {
 		case line, ok := <-lines:
 			if !ok {
-				fmt.Println("final state:", c.m.State())
-				return nil
+				return c.finish(readErr)
 			}
-			e, err := decode(line)
-			if err != nil {
-				fmt.Println(err)
-				continue
-			}
-			if err := c.handle(e); err != nil {
-				fmt.Println(err)
-			}
-		case ex := <-c.expire:
-			if ex.gen != c.gen {
-				continue // stale expiry from a timer already replaced or cancelled (TM-05)
-			}
+			c.command(line)
+		case <-c.expire:
+			// A timer stopped after it fired can still deliver its expiry.
+			// The order only starts a timer when none is running and only
+			// stops one as it leaves Pending, so a late expiry always finds
+			// it in a state that ignores EvTimeout.
 			if err := c.handle(order.EvTimeout); err != nil {
 				return err
 			}
@@ -72,7 +79,7 @@ func (c *client) loop(lines <-chan string) error {
 	}
 }
 
-// decode turns wire input into an event through a switch (VET-11).
+// decode turns wire input into an event through a switch.
 func decode(line string) (order.Event, error) {
 	switch line {
 	case "submit":
@@ -88,44 +95,69 @@ func decode(line string) (order.Event, error) {
 
 func (c *client) handle(e order.Event) error {
 	var acts order.Actions
-	var out order.Outcome
+	var out fsm.Outcome
 	c.m, acts, out = c.m.Fire(e)
-	switch out {
-	case order.Moved, order.Ignored:
-	case order.Rejected:
-		return fmt.Errorf("%v rejected in %v", e, c.m.State())
-	default:
-		panic("orderd: invalid outcome")
+	if err := out.Err(); err != nil {
+		return fmt.Errorf("%v in %v: %w", e, c.m.State(), err)
 	}
-	for i := range acts.Len() {
-		c.do(acts.At(i))
+	for a := order.Actions(1); a != 0; a <<= 1 {
+		if acts&a == 0 {
+			continue
+		}
+		if err := c.do(a); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (c *client) do(a order.Action) {
+func (c *client) do(a order.Actions) error {
 	switch a {
 	case order.ActSend, order.ActResend:
 		fmt.Println("send charge request")
 	case order.ActStartTimer:
 		c.stop()
-		gen := c.gen
-		c.timer = time.AfterFunc(timeout, func() { c.expire <- expiry{gen: gen} })
+		c.timer = time.AfterFunc(timeout, func() {
+			select {
+			case c.expire <- struct{}{}:
+			case <-c.quit:
+			}
+		})
 	case order.ActCancelTimer:
 		c.stop()
 	case order.ActModeChanged:
 		fmt.Println("mode:", c.m.Mode())
-	case order.ActNone:
 	default:
-		panic("orderd: invalid action")
+		return fmt.Errorf("unknown action %d", a)
 	}
+	return nil
 }
 
-// stop cancels any running timer and moves to a new generation, so an
-// expiry already in flight is recognised as stale.
+// stop cancels any running timer.
 func (c *client) stop() {
 	if c.timer != nil {
 		c.timer.Stop()
 	}
-	c.gen++
+}
+
+// finish reports how input ended: a read error, or the final state.
+func (c *client) finish(readErr <-chan error) error {
+	if err := <-readErr; err != nil {
+		return fmt.Errorf("reading commands: %w", err)
+	}
+	fmt.Println("final state:", c.m.State())
+	return nil
+}
+
+// command decodes one input line and fires it, reporting a bad line or a
+// rejected event without stopping.
+func (c *client) command(line string) {
+	e, err := decode(line)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if err := c.handle(e); err != nil {
+		fmt.Println(err)
+	}
 }

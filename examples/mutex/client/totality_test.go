@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/eitanity/merilo"
+	"code.eitanity.com/merilo"
+	"code.eitanity.com/merilo/fsm"
 )
 
 type table struct {
@@ -26,13 +27,10 @@ func newTable() table {
 func (t table) Machines() int { return len(t.machines) }
 func (t table) Events() int   { return len(t.events) }
 
-func (t table) Fire(m, e int) (quiet, unchanged bool) {
+func (t table) Fire(m, e int) (fsm.Outcome, bool) {
 	before := t.machines[m]
 	next, acts, out := before.Fire(t.events[e])
-	if out == outcomeNone {
-		panic("Fire returned no outcome")
-	}
-	return out == Ignored || out == Rejected, next == before && acts.Len() == 0
+	return out, next == before && acts == 0
 }
 
 func (t table) Name(m, e int) string {

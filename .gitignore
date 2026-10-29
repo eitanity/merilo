@@ -1,0 +1,16 @@
+# Build outputs: tools under bin/, the commands when built in place,
+# test binaries and anything compiled. make verify refuses any tracked
+# binary file.
+/bin/
+/merilovet
+/cmd/merilovet/merilovet
+/orderd
+/examples/order/cmd/orderd/orderd
+*.exe
+*.o
+*.a
+*.so
+*.test
+*.out
+*.cov
+*.prof

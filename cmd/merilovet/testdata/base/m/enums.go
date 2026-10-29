@@ -35,27 +35,18 @@ const (
 	ActSend
 )
 
-type Outcome uint8
-
-const (
-	outcomeNone Outcome = iota
-	Moved
-	Ignored
-	Rejected
-)
-
 const maxActions = 2
 
 type Actions struct {
 	list [maxActions]Action
-	n    uint8
+	n    int
 }
 
-func (a Actions) Len() int { return int(a.n) }
+func (a Actions) Len() int { return a.n }
 
 func (a Actions) At(i int) Action {
-	if i < 0 || i >= int(a.n) {
-		panic("m: action index out of range")
+	if i < 0 || i >= a.n {
+		return ActNone
 	}
 	return a.list[i]
 }

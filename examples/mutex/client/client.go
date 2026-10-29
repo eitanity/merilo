@@ -3,9 +3,12 @@
 // is not idempotent under duplicated grants, for the acceptance tests.
 package client
 
+import "code.eitanity.com/merilo/fsm"
+
 // State is the client's control state.
 type State uint8
 
+// State values.
 const (
 	stateNone State = iota
 	Idle
@@ -17,6 +20,7 @@ const (
 // Event is an input to Fire.
 type Event uint8
 
+// Event values.
 const (
 	eventNone Event = iota
 	EvWant
@@ -28,54 +32,24 @@ const (
 // Mode is derived from State. A client has one mode.
 type Mode uint8
 
+// Mode values.
 const (
 	modeNone Mode = iota
 	Normal
 	numModes
 )
 
-// Action is something the holder must do after a transition.
-type Action uint8
+// Actions is the set of things the holder must do after a transition, one
+// bit each. The holder performs them in declaration order. The zero value
+// is the empty set.
+type Actions uint64
 
+// Actions values.
 const (
-	ActNone Action = iota
-	ActRequest
+	ActRequest Actions = 1 << iota
 	ActRelease
 	ActModeChanged
 )
-
-// Outcome reports what Fire did with an event.
-type Outcome uint8
-
-const (
-	outcomeNone Outcome = iota
-	Moved
-	Ignored
-	Rejected
-)
-
-const maxActions = 2
-
-// Actions is a fixed-size list of actions.
-type Actions struct {
-	list [maxActions]Action
-	n    uint8
-}
-
-// Len is the number of actions.
-func (a Actions) Len() int { return int(a.n) }
-
-// At returns action i, which must be below Len.
-func (a Actions) At(i int) Action {
-	if i < 0 || i >= int(a.n) {
-		panic("client: action index out of range")
-	}
-	return a.list[i]
-}
-
-func one(x Action) Actions {
-	return Actions{list: [maxActions]Action{x}, n: 1}
-}
 
 // Machine is one client. Build it with New and change it only with Fire.
 type Machine struct {
@@ -97,21 +71,12 @@ func (m Machine) Mode() Mode {
 	case Idle, Waiting, Holding:
 		return Normal
 	default:
-		panic("client: invalid state; machine not built with New")
+		return modeNone
 	}
-}
-
-// AppendKey appends every field, in declaration order.
-func (m Machine) AppendKey(b []byte) []byte {
-	stale := byte(0)
-	if m.acceptStale {
-		stale = 1
-	}
-	return append(b, byte(m.state), stale)
 }
 
 // Fire applies e and returns the next machine, its actions and what happened.
-func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
+func (m Machine) Fire(e Event) (Machine, Actions, fsm.Outcome) {
 	switch m.state {
 	case Idle:
 		return m.fireIdle(e)
@@ -120,51 +85,51 @@ func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
 	case Holding:
 		return m.fireHolding(e)
 	default:
-		panic("client: invalid state; machine not built with New")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireIdle(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireIdle(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvWant:
 		m.state = Waiting
-		return m, one(ActRequest), Moved
+		return m, ActRequest, fsm.Moved
 	case EvGrant:
 		if m.acceptStale {
 			m.state = Holding
-			return m, Actions{}, Moved
+			return m, 0, fsm.Moved
 		}
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	case EvDone:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	default:
-		panic("client: undeclared event in Idle")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireWaiting(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireWaiting(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvWant, EvDone:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvGrant:
 		m.state = Holding
-		return m, Actions{}, Moved
+		return m, 0, fsm.Moved
 	default:
-		panic("client: undeclared event in Waiting")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireHolding(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireHolding(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvWant:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvGrant:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	case EvDone:
 		m.state = Idle
-		return m, one(ActRelease), Moved
+		return m, ActRelease, fsm.Moved
 	default:
-		panic("client: undeclared event in Holding")
+		return m, 0, fsm.Invalid
 	}
 }
 
@@ -177,7 +142,7 @@ func (s State) String() string {
 	case Holding:
 		return "Holding"
 	default:
-		panic("client: invalid state")
+		return "invalid"
 	}
 }
 
@@ -186,6 +151,6 @@ func (m Mode) String() string {
 	case Normal:
 		return "Normal"
 	default:
-		panic("client: invalid mode")
+		return "invalid"
 	}
 }

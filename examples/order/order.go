@@ -3,9 +3,12 @@
 // or Cancelled.
 package order
 
+import "code.eitanity.com/merilo/fsm"
+
 // State is an order's control state.
 type State uint8
 
+// State values.
 const (
 	stateNone State = iota
 	Idle
@@ -19,6 +22,7 @@ const (
 // Event is an input to Fire.
 type Event uint8
 
+// Event values.
 const (
 	eventNone Event = iota
 	EvSubmit
@@ -31,6 +35,7 @@ const (
 // Mode is derived from State.
 type Mode uint8
 
+// Mode values.
 const (
 	modeNone Mode = iota
 	Normal
@@ -38,75 +43,40 @@ const (
 	numModes
 )
 
-// Action is something the holder must do after a transition.
-type Action uint8
+// Actions is the set of things the holder must do after a transition, one
+// bit each. The holder performs them in declaration order. The zero value
+// is the empty set.
+type Actions uint64
 
+// Actions values.
 const (
-	ActNone Action = iota
-	ActSend
+	ActSend Actions = 1 << iota
 	ActResend
 	ActStartTimer
 	ActCancelTimer
 	ActModeChanged
 )
 
-// Outcome reports what Fire did with an event.
-type Outcome uint8
-
-const (
-	outcomeNone Outcome = iota
-	Moved
-	Ignored
-	Rejected
-)
+// invalidName is what String returns for a value outside the declared constants.
+const invalidName = "invalid"
 
 // MaxRetries is the protocol's resend budget before giving up.
 const MaxRetries = 3
 
-const maxActions = 3 // most actions any one transition emits, incl. ActModeChanged
-
-// Actions is a fixed-size list of actions.
-type Actions struct {
-	list [maxActions]Action
-	n    uint8
-}
-
-// Len is the number of actions.
-func (a Actions) Len() int { return int(a.n) }
-
-// At returns action i, which must be below Len.
-func (a Actions) At(i int) Action {
-	if i < 0 || i >= int(a.n) {
-		panic("order: action index out of range")
-	}
-	return a.list[i]
-}
-
-func one(x Action) Actions { return Actions{}.with(x) }
-
-func (a Actions) with(x Action) Actions {
-	if int(a.n) >= maxActions {
-		panic("order: more than maxActions actions")
-	}
-	a.list[a.n] = x
-	a.n++
-	return a
-}
-
 // Machine is one order. Build it with New and change it only with Fire.
 type Machine struct {
 	state   State
-	retries uint8
+	retries fsm.Counter // resends made, up to MaxRetries
 }
 
 // New returns an order in Idle.
-func New() Machine { return Machine{state: Idle} }
+func New() Machine { return Machine{state: Idle, retries: fsm.NewCounter(MaxRetries)} }
 
 // State returns the control state.
 func (m Machine) State() State { return m.state }
 
 // Retries returns how many resends have been made.
-func (m Machine) Retries() uint8 { return m.retries }
+func (m Machine) Retries() int64 { return m.retries.Value() }
 
 // Mode derives the mode from the state.
 func (m Machine) Mode() Mode {
@@ -116,13 +86,8 @@ func (m Machine) Mode() Mode {
 	case Paid, Failed, Cancelled:
 		return Closed
 	default:
-		panic("order: invalid state; machine not built with New")
+		return modeNone
 	}
-}
-
-// AppendKey appends every field, in declaration order.
-func (m Machine) AppendKey(b []byte) []byte {
-	return append(b, byte(m.state), m.retries)
 }
 
 func modeAllowed(from, to Mode) bool {
@@ -132,16 +97,16 @@ func modeAllowed(from, to Mode) bool {
 	case Closed:
 		return false
 	default:
-		panic("order: invalid mode")
+		return false
 	}
 }
 
 // Fire applies e and returns the next machine, the actions to perform and
 // what happened.
-func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
+func (m Machine) Fire(e Event) (Machine, Actions, fsm.Outcome) {
 	var next Machine
 	var acts Actions
-	var out Outcome
+	var out fsm.Outcome
 	switch m.state {
 	case Idle:
 		next, acts, out = m.fireIdle(e)
@@ -154,84 +119,85 @@ func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
 	case Cancelled:
 		next, acts, out = m.fireCancelled(e)
 	default:
-		panic("order: invalid state; machine not built with New")
+		return m, 0, fsm.Invalid
 	}
 	if next.Mode() != m.Mode() {
 		if !modeAllowed(m.Mode(), next.Mode()) {
-			panic("order: undeclared mode change")
+			return m, 0, fsm.Invalid
 		}
-		acts = acts.with(ActModeChanged)
+		acts |= ActModeChanged
 	}
 	return next, acts, out
 }
 
-func (m Machine) fireIdle(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireIdle(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit:
 		m.state = Pending
-		return m, one(ActSend).with(ActStartTimer), Moved
+		return m, ActSend | ActStartTimer, fsm.Moved
 	case EvAck, EvTimeout:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	case EvCancel:
 		m.state = Cancelled
-		return m, Actions{}, Moved
+		return m, 0, fsm.Moved
 	default:
-		panic("order: undeclared event in Idle")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) firePending(e Event) (Machine, Actions, Outcome) {
+func (m Machine) firePending(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvAck:
 		m.state = Paid
-		return m, one(ActCancelTimer), Moved
+		return m, ActCancelTimer, fsm.Moved
 	case EvTimeout:
-		if m.retries >= MaxRetries {
+		retries, ok := m.retries.Inc()
+		if !ok {
 			m.state = Failed
-			return m, Actions{}, Moved
+			return m, 0, fsm.Moved
 		}
-		m.retries++
-		return m, one(ActResend).with(ActStartTimer), Moved
+		m.retries = retries
+		return m, ActResend | ActStartTimer, fsm.Moved
 	case EvCancel:
 		m.state = Cancelled
-		return m, one(ActCancelTimer), Moved
+		return m, ActCancelTimer, fsm.Moved
 	default:
-		panic("order: undeclared event in Pending")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) firePaid(e Event) (Machine, Actions, Outcome) {
+func (m Machine) firePaid(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit, EvCancel:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvAck, EvTimeout:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("order: undeclared event in Paid")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireFailed(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireFailed(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit, EvCancel:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvAck, EvTimeout:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("order: undeclared event in Failed")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireCancelled(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireCancelled(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit, EvCancel:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvAck, EvTimeout:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("order: undeclared event in Cancelled")
+		return m, 0, fsm.Invalid
 	}
 }
 
@@ -248,7 +214,7 @@ func (s State) String() string {
 	case Cancelled:
 		return "Cancelled"
 	default:
-		panic("order: invalid state")
+		return invalidName
 	}
 }
 
@@ -263,7 +229,7 @@ func (e Event) String() string {
 	case EvCancel:
 		return "Cancel"
 	default:
-		panic("order: invalid event")
+		return invalidName
 	}
 }
 
@@ -274,6 +240,6 @@ func (m Mode) String() string {
 	case Closed:
 		return "Closed"
 	default:
-		panic("order: invalid mode")
+		return invalidName
 	}
 }

@@ -7,120 +7,185 @@ import (
 	"go/types"
 )
 
-// vet17: Fire's actions and outcome go to local variables, and each is read
-// later in the same block before it is assigned again.
-func (c *checker) vet17(i int) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	call, _, ok := c.fireCall(c.fl[i].node)
+// vet10: Fire's outcome, and its actions when the machine has them, go to
+// local variables, and each is read later in the same block before it is
+// assigned again.
+func (c *checker) vet10(i int) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	call, sel, ok := c.fireCall(c.fl[i].node)
 	if !ok || c.inMachineMethod(i) {
 		return
 	}
 	parent := c.fl[i].parent
-	assert(parent >= 0, "a call always has a parent")
+	if parent < 0 {
+		c.flt.fault("a call always has a parent")
+		return
+	}
 	as, ok := c.fl[parent].node.(*ast.AssignStmt)
-	if !ok || len(as.Lhs) != 3 || len(as.Rhs) != 1 || as.Rhs[0] != call {
-		c.add(call, "VET-17", "the actions and outcome of Fire must go to local variables")
+	if !ok || len(as.Lhs) != c.fireResults(sel) || len(as.Rhs) != 1 || as.Rhs[0] != call {
+		c.add(call, "VET-10", "the results of Fire must go to local variables")
 		return
 	}
 	for _, lhs := range as.Lhs[1:] {
-		c.vet17Result(parent, lhs)
+		c.vet10Result(parent, lhs)
 	}
 }
 
-// vet17Result checks one result variable of the Fire assignment at stmt.
-func (c *checker) vet17Result(stmt int, lhs ast.Expr) {
-	assert(stmt >= 0 && stmt < len(c.fl), "statement index out of range")
-	assert(lhs != nil, "vet17Result needs an expression")
-	id, ok := ast.Unparen(lhs).(*ast.Ident)
-	if !ok || id.Name == "_" || !c.isLocal(c.p.info.ObjectOf(id)) {
-		c.add(lhs, "VET-17", "a Fire result must go to a local variable")
+// vet10Result checks one result variable of the Fire assignment at stmt.
+func (c *checker) vet10Result(stmt int, lhs ast.Expr) {
+	if c == nil {
 		return
 	}
-	obj := c.p.info.ObjectOf(id)
+	if stmt < 0 || stmt >= len(c.fl) {
+		c.flt.fault("statement index out of range")
+		return
+	}
+	if lhs == nil {
+		c.flt.fault("vet10Result needs an expression")
+		return
+	}
+	id, ok := ast.Unparen(lhs).(*ast.Ident)
+	if !ok || id.Name == "_" || !c.isLocal(c.info.ObjectOf(id)) {
+		c.add(lhs, "VET-10", "a Fire result must go to a local variable")
+		return
+	}
+	obj := c.info.ObjectOf(id)
 	block := c.fl[stmt].parent
-	assert(block >= 0, "a statement always has a parent")
+	if block < 0 {
+		c.flt.fault("a statement always has a parent")
+		return
+	}
 	stop := c.fl[block].end
+	skip := 0 // entries below skip lie inside a function literal
 	for x := c.fl[stmt].end; x < stop; x++ {
+		if x < skip {
+			continue
+		}
 		if _, lit := c.fl[x].node.(*ast.FuncLit); lit {
-			x = c.fl[x].end - 1
+			skip = c.fl[x].end
 			continue
 		}
 		ref, ok := c.fl[x].node.(*ast.Ident)
-		if ok && c.p.info.Uses[ref] == obj {
-			c.vet17Use(x, id)
+		if ok && c.uses[ref] == obj {
+			c.vet10Use(x, id)
 			return
 		}
 	}
-	c.add(id, "VET-17", id.Name+" from Fire is never read in its block")
+	c.add(id, "VET-10", id.Name+" from Fire is never read in its block")
 }
 
-// vet17Use judges the first mention after the Fire assignment: a plain
+// vet10Use judges the first mention after the Fire assignment: a plain
 // read passes, a reassignment or a discard with _ = x does not.
-func (c *checker) vet17Use(x int, id *ast.Ident) {
-	assert(x >= 0 && x < len(c.fl), "entry index out of range")
-	assert(id != nil, "vet17Use needs the assigned identifier")
+func (c *checker) vet10Use(x int, id *ast.Ident) {
+	if c == nil {
+		return
+	}
+	if x < 0 || x >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if id == nil {
+		c.flt.fault("vet10Use needs the assigned identifier")
+		return
+	}
 	ref, ok := c.fl[x].node.(*ast.Ident)
-	assert(ok, "vet17Use is called on an identifier")
+	if !ok {
+		c.flt.fault("vet10Use is called on an identifier")
+		return
+	}
 	as, ok := c.fl[c.fl[x].parent].node.(*ast.AssignStmt)
 	if !ok {
 		return
 	}
-	if len(as.Lhs) == 1 && isBlank(as.Lhs[0]) && len(as.Rhs) == 1 && ast.Unparen(as.Rhs[0]) == ref {
-		c.add(as, "VET-17", id.Name+" from Fire is discarded with _ =")
+	if len(as.Lhs) == 1 && isBlank(c.flt, as.Lhs[0]) && len(as.Rhs) == 1 && ast.Unparen(as.Rhs[0]) == ref {
+		c.add(as, "VET-10", id.Name+" from Fire is discarded with _ =")
 		return
 	}
-	if containsExpr(as.Lhs, ref) {
-		c.add(id, "VET-17", id.Name+" from Fire is assigned again before it is read")
+	if containsExpr(c.flt, as.Lhs, ref) {
+		c.add(id, "VET-10", id.Name+" from Fire is assigned again before it is read")
 	}
 }
 
-// vet21: no existing machine-bearing value is copied, and a fresh one never
+// vet12: no existing machine-bearing value is copied, and a fresh one never
 // overwrites a live location except by map insert.
-func (c *checker) vet21(i int) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(c.p.info != nil, "vet21 needs type information")
+func (c *checker) vet12(i int) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if c.info == nil {
+		c.flt.fault("vet12 needs type information")
+		return
+	}
 	switch x := c.fl[i].node.(type) {
 	case *ast.AssignStmt:
-		c.vet21Overwrite(i, x)
+		c.vet12Overwrite(i, x)
 	case *ast.RangeStmt:
-		c.vet21Range(i, x)
+		c.vet12Range(i, x)
 	case *ast.FuncDecl:
-		c.vet21Receiver(x)
+		c.vet12Receiver(x)
 	case ast.Expr:
-		c.vet21Copy(i, x)
+		c.vet12Copy(i, x)
 	}
 }
 
-func (c *checker) vet21Copy(i int, e ast.Expr) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(e != nil, "vet21Copy needs an expression")
+func (c *checker) vet12Copy(i int, e ast.Expr) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if e == nil {
+		c.flt.fault("vet12Copy needs an expression")
+		return
+	}
 	if !c.existing(e) {
 		return
 	}
-	t := c.p.info.TypeOf(e)
+	t := c.info.TypeOf(e)
 	if !c.md.bearing(t) || c.exempt(i, t) || !c.copyContext(c.fl[i].parent, e) {
 		return
 	}
-	c.add(e, "VET-21", "copy of an existing "+types.TypeString(t, types.RelativeTo(c.p.types)))
+	c.add(e, "VET-12", "copy of an existing "+types.TypeString(t, types.RelativeTo(c.pkgTypes)))
 }
 
 // existing reports whether e denotes a value already stored somewhere, as
 // opposed to a fresh literal or call result.
 func (c *checker) existing(e ast.Expr) bool {
-	assert(e != nil, "existing needs an expression")
-	assert(c.p.info != nil, "existing needs type information")
-	if tv, ok := c.p.info.Types[e]; ok && !tv.IsValue() {
+	if c == nil {
+		return false
+	}
+	if e == nil {
+		c.flt.fault("existing needs an expression")
+		return false
+	}
+	if c.info == nil {
+		c.flt.fault("existing needs type information")
+		return false
+	}
+	if tv, ok := c.tvs[e]; ok && !tv.IsValue() {
 		return false
 	}
 	switch x := ast.Unparen(e).(type) {
 	case *ast.Ident:
-		_, ok := c.p.info.Uses[x].(*types.Var)
+		_, ok := c.uses[x].(*types.Var)
 		return ok
 	case *ast.SelectorExpr:
-		if s, ok := c.p.info.Selections[x]; ok {
+		if s, ok := c.sels[x]; ok {
 			return s.Kind() == types.FieldVal
 		}
-		_, ok := c.p.info.Uses[x.Sel].(*types.Var)
+		_, ok := c.uses[x.Sel].(*types.Var)
 		return ok
 	case *ast.IndexExpr, *ast.StarExpr, *ast.TypeAssertExpr:
 		return true
@@ -133,19 +198,28 @@ func (c *checker) existing(e ast.Expr) bool {
 // copyContext reports whether parent copies child: assignment and
 // declaration values, arguments, results, literal elements and sends.
 func (c *checker) copyContext(parent int, child ast.Expr) bool {
-	assert(parent >= 0 && parent < len(c.fl), "parent index out of range")
-	assert(child != nil, "copyContext needs an expression")
+	if c == nil {
+		return false
+	}
+	if parent < 0 || parent >= len(c.fl) {
+		c.flt.fault("parent index out of range")
+		return false
+	}
+	if child == nil {
+		c.flt.fault("copyContext needs an expression")
+		return false
+	}
 	switch p := c.fl[parent].node.(type) {
 	case *ast.AssignStmt:
-		return containsExpr(p.Rhs, child)
+		return containsExpr(c.flt, p.Rhs, child)
 	case *ast.ValueSpec:
-		return containsExpr(p.Values, child)
+		return containsExpr(c.flt, p.Values, child)
 	case *ast.ReturnStmt:
-		return containsExpr(p.Results, child)
+		return containsExpr(c.flt, p.Results, child)
 	case *ast.CallExpr:
-		return containsExpr(p.Args, child) && !c.isBuiltin(p.Fun, "len") && !c.isBuiltin(p.Fun, "cap")
+		return containsExpr(c.flt, p.Args, child) && !c.isBuiltin(p.Fun, "len") && !c.isBuiltin(p.Fun, "cap")
 	case *ast.CompositeLit:
-		return containsExpr(p.Elts, child)
+		return containsExpr(c.flt, p.Elts, child)
 	case *ast.KeyValueExpr:
 		return p.Value == child
 	case *ast.SendStmt:
@@ -154,17 +228,26 @@ func (c *checker) copyContext(parent int, child ast.Expr) bool {
 	return false
 }
 
-// vet21Overwrite flags a fresh value assigned over a live machine-bearing
+// vet12Overwrite flags a fresh value assigned over a live machine-bearing
 // location; a reset is a transition, and only a map insert is allowed.
-func (c *checker) vet21Overwrite(i int, as *ast.AssignStmt) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(as != nil && len(as.Rhs) > 0, "vet21Overwrite needs an assignment")
+func (c *checker) vet12Overwrite(i int, as *ast.AssignStmt) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if as == nil || len(as.Rhs) == 0 {
+		c.flt.fault("vet12Overwrite needs an assignment")
+		return
+	}
 	if as.Tok != token.ASSIGN {
 		return
 	}
 	for k, lhs := range as.Lhs {
-		t := c.p.info.TypeOf(lhs)
-		if isBlank(lhs) || !c.md.bearing(t) || c.exempt(i, t) || c.isMapIndex(lhs) {
+		t := c.info.TypeOf(lhs)
+		if isBlank(c.flt, lhs) || !c.md.bearing(t) || c.exempt(i, t) || c.isMapIndex(lhs) {
 			continue
 		}
 		rhs := as.Rhs[0]
@@ -175,105 +258,169 @@ func (c *checker) vet21Overwrite(i int, as *ast.AssignStmt) {
 			continue
 		}
 		if c.fresh(rhs) {
-			c.add(lhs, "VET-21", "fresh value overwrites a live machine; a reset is a transition")
+			c.add(lhs, "VET-12", "fresh value overwrites a live machine; a reset is a transition")
 		}
 	}
 }
 
 // fresh reports whether e makes a new value: a literal or a function call.
 func (c *checker) fresh(e ast.Expr) bool {
-	assert(e != nil, "fresh needs an expression")
-	assert(c.p.info != nil, "fresh needs type information")
+	if c == nil {
+		return false
+	}
+	if e == nil {
+		c.flt.fault("fresh needs an expression")
+		return false
+	}
+	if c.info == nil {
+		c.flt.fault("fresh needs type information")
+		return false
+	}
 	switch x := ast.Unparen(e).(type) {
 	case *ast.CompositeLit:
 		return true
 	case *ast.CallExpr:
-		fun, ok := c.p.info.Types[x.Fun]
+		fun, ok := c.tvs[x.Fun]
 		return !ok || !fun.IsType()
 	}
 	return false
 }
 
 func (c *checker) isMapIndex(e ast.Expr) bool {
-	assert(e != nil, "isMapIndex needs an expression")
-	assert(c.p.info != nil, "isMapIndex needs type information")
+	if c == nil {
+		return false
+	}
+	if e == nil {
+		c.flt.fault("isMapIndex needs an expression")
+		return false
+	}
+	if c.info == nil {
+		c.flt.fault("isMapIndex needs type information")
+		return false
+	}
 	ix, ok := ast.Unparen(e).(*ast.IndexExpr)
 	if !ok {
 		return false
 	}
-	_, isMap := c.p.info.TypeOf(ix.X).Underlying().(*types.Map)
+	_, isMap := c.info.TypeOf(ix.X).Underlying().(*types.Map)
 	return isMap
 }
 
-// vet21Range flags a range value variable that copies machine-bearing elements.
-func (c *checker) vet21Range(i int, rs *ast.RangeStmt) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(rs != nil, "vet21Range needs a range statement")
-	if rs.Value == nil || isBlank(rs.Value) {
+// vet12Range flags a range value variable that copies machine-bearing elements.
+func (c *checker) vet12Range(i int, rs *ast.RangeStmt) {
+	if c == nil {
 		return
 	}
-	t := c.p.info.TypeOf(rs.Value)
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if rs == nil {
+		c.flt.fault("vet12Range needs a range statement")
+		return
+	}
+	if rs.Value == nil || isBlank(c.flt, rs.Value) {
+		return
+	}
+	t := c.info.TypeOf(rs.Value)
 	if c.md.bearing(t) && !c.exempt(i, t) {
-		c.add(rs.Value, "VET-21", "range value variable copies each machine-bearing element; loop by index")
+		c.add(rs.Value, "VET-12", "range value variable copies each machine-bearing element; loop by index")
 	}
 }
 
-// vet21Receiver flags a value receiver on a machine-bearing type other than
+// vet12Receiver flags a value receiver on a machine-bearing type other than
 // the machine itself.
-func (c *checker) vet21Receiver(fd *ast.FuncDecl) {
-	assert(fd != nil, "vet21Receiver needs a declaration")
-	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+func (c *checker) vet12Receiver(fd *ast.FuncDecl) {
+	if c == nil {
 		return
 	}
-	field := fd.Recv.List[0]
-	t := c.p.info.TypeOf(field.Type)
-	assert(t != nil, "a receiver has a type")
+	if fd == nil {
+		c.flt.fault("vet12Receiver needs a declaration")
+		return
+	}
+	recv := fd.Recv
+	if recv == nil || len(recv.List) == 0 {
+		return
+	}
+	field := recv.List[0]
+	t := c.info.TypeOf(field.Type)
+	if t == nil {
+		c.flt.fault("a receiver has a type")
+		return
+	}
 	if _, ptr := t.(*types.Pointer); ptr {
 		return
 	}
 	if c.md.bearing(t) && c.md.machineFor(t) == nil {
-		c.add(field, "VET-21", "value receiver copies a machine-bearing value; use a pointer receiver")
+		c.add(field, "VET-12", "value receiver copies a machine-bearing value; use a pointer receiver")
 	}
 }
 
-// vet22: no machine-bearing value is created implicitly.
-func (c *checker) vet22(i int) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(c.p.info != nil, "vet22 needs type information")
+// vet13: no machine-bearing value is created implicitly.
+func (c *checker) vet13(i int) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if c.info == nil {
+		c.flt.fault("vet13 needs type information")
+		return
+	}
 	switch x := c.fl[i].node.(type) {
 	case *ast.ValueSpec:
-		c.vet22Var(i, x)
+		c.vet13Var(i, x)
 	case *ast.CompositeLit:
-		c.vet22Lit(i, x)
+		c.vet13Lit(i, x)
 	case *ast.CallExpr:
-		c.vet22Alloc(i, x)
+		c.vet13Alloc(i, x)
 	}
 }
 
-func (c *checker) vet22Var(i int, vs *ast.ValueSpec) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(vs != nil, "vet22Var needs a value spec")
+func (c *checker) vet13Var(i int, vs *ast.ValueSpec) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if vs == nil {
+		c.flt.fault("vet13Var needs a value spec")
+		return
+	}
 	if len(vs.Values) > 0 {
 		return
 	}
 	for _, name := range vs.Names {
-		obj := c.p.info.Defs[name]
+		obj := c.defs[name]
 		if obj == nil {
 			continue
 		}
 		if t := obj.Type(); c.md.bearing(t) && !c.exempt(i, t) {
-			c.add(name, "VET-22", "var "+name.Name+" holds a machine not built with New")
+			c.add(name, "VET-13", "var "+name.Name+" holds a machine not built with New")
 		}
 	}
 }
 
-func (c *checker) vet22Lit(i int, lit *ast.CompositeLit) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(lit != nil, "vet22Lit needs a literal")
-	t := c.p.info.TypeOf(lit)
+func (c *checker) vet13Lit(i int, lit *ast.CompositeLit) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if lit == nil {
+		c.flt.fault("vet13Lit needs a literal")
+		return
+	}
+	t := c.info.TypeOf(lit)
 	if m := c.md.machineFor(t); m != nil {
-		if m.pkg != c.p.types {
-			c.add(lit, "VET-22", m.named.Obj().Name()+" literal outside its package; use New")
+		if m.pkg != c.pkgTypes {
+			c.add(lit, "VET-13", m.named.Obj().Name()+" literal outside its package; use New")
 		}
 		return
 	}
@@ -282,19 +429,28 @@ func (c *checker) vet22Lit(i int, lit *ast.CompositeLit) {
 	}
 	switch u := t.Underlying().(type) {
 	case *types.Struct:
-		c.vet22Fields(lit, u)
+		c.vet13Fields(lit, u)
 	case *types.Array:
 		if int64(len(lit.Elts)) < u.Len() {
-			c.add(lit, "VET-22", "array literal leaves machine-bearing elements zero")
+			c.add(lit, "VET-13", "array literal leaves machine-bearing elements zero")
 		}
 	}
 }
 
-// vet22Fields flags a keyed or empty struct literal that omits a
+// vet13Fields flags a keyed or empty struct literal that omits a
 // machine-bearing field; an unkeyed literal must list every field anyway.
-func (c *checker) vet22Fields(lit *ast.CompositeLit, st *types.Struct) {
-	assert(lit != nil, "vet22Fields needs a literal")
-	assert(st != nil, "vet22Fields needs a struct")
+func (c *checker) vet13Fields(lit *ast.CompositeLit, st *types.Struct) {
+	if c == nil {
+		return
+	}
+	if lit == nil {
+		c.flt.fault("vet13Fields needs a literal")
+		return
+	}
+	if st == nil {
+		c.flt.fault("vet13Fields needs a struct")
+		return
+	}
 	keys := map[string]bool{}
 	for _, e := range lit.Elts {
 		kv, ok := e.(*ast.KeyValueExpr)
@@ -307,21 +463,30 @@ func (c *checker) vet22Fields(lit *ast.CompositeLit, st *types.Struct) {
 	}
 	for f := range st.NumFields() {
 		if field := st.Field(f); c.md.bearing(field.Type()) && !keys[field.Name()] {
-			c.add(lit, "VET-22", "literal omits machine-bearing field "+field.Name())
+			c.add(lit, "VET-13", "literal omits machine-bearing field "+field.Name())
 		}
 	}
 }
 
-// vet22Alloc flags new(T) and a non-empty make([]T, n) of machine-bearing T.
-func (c *checker) vet22Alloc(i int, call *ast.CallExpr) {
-	assert(i >= 0 && i < len(c.fl), "entry index out of range")
-	assert(call != nil, "vet22Alloc needs a call")
+// vet13Alloc flags new(T) and a non-empty make([]T, n) of machine-bearing T.
+func (c *checker) vet13Alloc(i int, call *ast.CallExpr) {
+	if c == nil {
+		return
+	}
+	if i < 0 || i >= len(c.fl) {
+		c.flt.fault("entry index out of range")
+		return
+	}
+	if call == nil {
+		c.flt.fault("vet13Alloc needs a call")
+		return
+	}
 	if len(call.Args) == 0 {
 		return
 	}
-	t := c.p.info.TypeOf(call.Args[0])
+	t := c.info.TypeOf(call.Args[0])
 	if c.isBuiltin(call.Fun, "new") && c.md.bearing(t) && !c.exempt(i, t) {
-		c.add(call, "VET-22", "new allocates a machine not built with New")
+		c.add(call, "VET-13", "new allocates a machine not built with New")
 		return
 	}
 	if !c.isBuiltin(call.Fun, "make") || len(call.Args) < 2 {
@@ -331,8 +496,8 @@ func (c *checker) vet22Alloc(i int, call *ast.CallExpr) {
 	if !ok || !c.md.bearing(sl.Elem()) {
 		return
 	}
-	if tv, ok := c.p.info.Types[call.Args[1]]; ok && tv.Value != nil && constant.Sign(tv.Value) == 0 {
+	if tv, ok := c.tvs[call.Args[1]]; ok && tv.Value != nil && constant.Sign(tv.Value) == 0 {
 		return
 	}
-	c.add(call, "VET-22", "make creates machines not built with New")
+	c.add(call, "VET-13", "make creates machines not built with New")
 }

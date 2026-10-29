@@ -1,5 +1,5 @@
 package h
 
-import "fixture/m"
+import "code.eitanity.com/merilo"
 
-func Decode(b byte) m.Event { return m.Event(b) }
+const version = merilo.Version

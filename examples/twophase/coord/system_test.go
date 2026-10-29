@@ -5,29 +5,41 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/eitanity/merilo"
-	"github.com/eitanity/merilo/examples/twophase/coord"
+	"code.eitanity.com/merilo"
+	"code.eitanity.com/merilo/examples/twophase/coord"
+	"code.eitanity.com/merilo/fsm"
 )
 
+// Step kinds. A vote has one kind per participant: kYes+i is participant
+// i voting yes.
 const (
-	kStart merilo.Kind = iota
-	kYes
-	kNo
+	kStart = iota
 	kTick
 	kResume
-	numKinds
+	kYes
+	kNo      = kYes + coord.Participants
+	numKinds = kNo + coord.Participants
 )
 
+// slot splits kind k into its step and, for a vote, the participant.
+func slot(k int) (step, i int) {
+	switch {
+	case k >= kNo:
+		return kNo, k - kNo
+	case k >= kYes:
+		return kYes, k - kYes
+	}
+	return k, 0
+}
+
+// vote is a participant's ballot.
+type vote uint8
+
 const (
-	voteNone uint8 = iota
+	voteNone vote = iota
 	voteYes
 	voteNo
 )
-
-// SysMode mirrors the coordinator's mode at system level.
-type SysMode string
-
-func (m SysMode) String() string { return string(m) }
 
 // sys is one coordinator and two participants who vote once each, after
 // the coordinator asks.
@@ -36,8 +48,8 @@ type sys struct {
 	c        coord.Machine
 	timer    bool
 	asked    bool
-	votes    [coord.Participants]uint8
-	decision coord.Action
+	votes    [coord.Participants]vote
+	decision coord.Actions
 }
 
 func newSys(b coord.Bug) *sys {
@@ -48,48 +60,59 @@ func newSys(b coord.Bug) *sys {
 
 func (s *sys) Reset() { *s = sys{bug: s.bug, c: coord.New(s.bug)} }
 
-func (s *sys) Kinds() int { return int(numKinds) }
+func (s *sys) Kinds() int { return numKinds }
 
 func (s *sys) Invariants() []string {
 	return []string{"commit only when every participant voted yes", "the decision matches the coordinator's state"}
 }
 
-func (s *sys) Steps(buf []merilo.Step) []merilo.Step {
-	if s.c.State() == coord.Init {
-		buf = append(buf, merilo.Step{Kind: kStart})
+func (s *sys) Enabled(k int) bool {
+	if k < 0 || k >= numKinds {
+		return false
 	}
-	for i, v := range s.votes {
-		if s.asked && v == voteNone {
-			buf = append(buf, merilo.Step{Kind: kYes, Arg: i}, merilo.Step{Kind: kNo, Arg: i})
-		}
+	step, i := slot(k)
+	switch step {
+	case kStart:
+		return s.c.State() == coord.Init
+	case kTick:
+		return s.timer
+	case kResume:
+		return s.c.State() == coord.Recovering
+	case kYes, kNo:
+		return s.asked && s.votes[i] == voteNone
 	}
-	if s.timer {
-		buf = append(buf, merilo.Step{Kind: kTick})
-	}
-	if s.c.State() == coord.Recovering {
-		buf = append(buf, merilo.Step{Kind: kResume})
-	}
-	return buf
+	return false
 }
 
-func (s *sys) Apply(st merilo.Step) error {
+func (s *sys) Apply(k int) error {
 	before := s.c.Mode()
-	switch st.Kind {
+	step, i := slot(k)
+	switch step {
 	case kStart:
-		s.fire(coord.EvStart)
+		if err := s.fire(coord.EvStart); err != nil {
+			return err
+		}
 	case kYes:
-		s.votes[st.Arg] = voteYes
-		s.fire(coord.EvYes)
+		s.votes[i] = voteYes
+		if err := s.fire(coord.EvYes); err != nil {
+			return err
+		}
 	case kNo:
-		s.votes[st.Arg] = voteNo
-		s.fire(coord.EvNo)
+		s.votes[i] = voteNo
+		if err := s.fire(coord.EvNo); err != nil {
+			return err
+		}
 	case kTick:
 		s.timer = false
-		s.fire(coord.EvTimeout)
+		if err := s.fire(coord.EvTimeout); err != nil {
+			return err
+		}
 	case kResume:
-		s.fire(coord.EvResume)
+		if err := s.fire(coord.EvResume); err != nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("unknown step kind %d", st.Kind)
+		return fmt.Errorf("unknown step kind %d", k)
 	}
 	if after := s.c.Mode(); after != before && !sysModeAllowed(before, after) {
 		return fmt.Errorf("%w: %v -> %v", merilo.ErrModeChange, before, after)
@@ -98,7 +121,7 @@ func (s *sys) Apply(st merilo.Step) error {
 }
 
 // sysModeAllowed is the system's own table of mode changes; it agrees
-// with the coordinator's, so only a machine panic can report AC-03.
+// with the coordinator's, so only a machine panic can report the seeded mode change.
 func sysModeAllowed(from, to coord.Mode) bool {
 	switch from {
 	case coord.Normal:
@@ -112,15 +135,15 @@ func sysModeAllowed(from, to coord.Mode) bool {
 	}
 }
 
-func (s *sys) fire(e coord.Event) {
+func (s *sys) fire(e coord.Event) error {
 	var acts coord.Actions
-	var out coord.Outcome
+	var out fsm.Outcome
 	s.c, acts, out = s.c.Fire(e)
-	if out == coord.Rejected {
-		panic(fmt.Sprintf("coordinator rejected %d", e))
+	if out == fsm.Rejected || out == fsm.Invalid {
+		return fmt.Errorf("coordinator refused event %d with outcome %d", e, out)
 	}
-	for i := range acts.Len() {
-		switch a := acts.At(i); a {
+	for a := coord.Actions(1); a != 0; a <<= 1 {
+		switch acts & a {
 		case coord.ActPrepare:
 			s.asked = true
 		case coord.ActCommit, coord.ActAbort:
@@ -129,23 +152,14 @@ func (s *sys) fire(e coord.Event) {
 			s.timer = true
 		case coord.ActCancelTimer:
 			s.timer = false
-		case coord.ActModeChanged, coord.ActNone:
+		case coord.ActModeChanged:
 		}
 	}
+	return nil
 }
 
-func (s *sys) Key(buf []byte) []byte {
-	buf = s.c.AppendKey(buf)
-	buf = append(buf, b(s.timer), b(s.asked), byte(s.decision))
-	return append(buf, s.votes[:]...)
-}
-
-func b(v bool) byte {
-	if v {
-		return 1
-	}
-	return 0
-}
+// World is the whole adapter: the coordinator, the timer and the votes.
+func (s *sys) World() any { return *s }
 
 func (s *sys) Check() error {
 	if s.decision == coord.ActCommit {
@@ -162,8 +176,7 @@ func (s *sys) Check() error {
 	return nil
 }
 
-func (s *sys) Mode() fmt.Stringer { return SysMode(s.c.Mode().String()) }
-func (s *sys) Tuple() string      { return s.c.State().String() }
+func (s *sys) Tuple() string { return s.c.State().String() }
 
 func (s *sys) Settled() bool {
 	switch s.c.State() {
@@ -174,26 +187,27 @@ func (s *sys) Settled() bool {
 	}
 }
 
-func (s *sys) Describe(st merilo.Step) string {
-	switch st.Kind {
+func (s *sys) Describe(k int) string {
+	step, i := slot(k)
+	switch step {
 	case kStart:
 		return "start"
 	case kYes:
-		return fmt.Sprintf("p%d votes yes", st.Arg)
+		return fmt.Sprintf("p%d votes yes", i)
 	case kNo:
-		return fmt.Sprintf("p%d votes no", st.Arg)
+		return fmt.Sprintf("p%d votes no", i)
 	case kTick:
 		return "timeout"
 	case kResume:
 		return "resume"
 	default:
-		return fmt.Sprintf("kind %d", st.Kind)
+		return fmt.Sprintf("kind %d", k)
 	}
 }
 
-var opts = merilo.Options{MaxDepth: 20, MaxStates: 10000, RequireComplete: true}
+var opts = merilo.Options{MaxStates: 10000, RequireComplete: true}
 
-// AC-01: the seeded commit-on-timeout bug is found with the hand-derived
+// The seeded commit-on-timeout bug is found with the hand-derived
 // shortest trace: start, one yes vote, timeout.
 func TestSeededCommitOnTimeout(t *testing.T) {
 	r := explore(t, newSys(coord.CommitOnTimeout))
@@ -202,12 +216,13 @@ func TestSeededCommitOnTimeout(t *testing.T) {
 	}
 }
 
-// AC-03: the seeded Degraded-to-Normal change panics in the machine and
-// is reported with its shortest trace: start, timeout, one yes vote.
+// The machine refuses the seeded Degraded-to-Normal change as
+// Invalid, the adapter reports it, and the explorer gives its shortest
+// trace: start, timeout, one yes vote.
 func TestSeededSkipRecovery(t *testing.T) {
 	r := explore(t, newSys(coord.SkipRecovery))
-	if r.Violation.Kind != merilo.Panic || len(r.Violation.Trace) != 3 {
-		t.Errorf("got %v with trace %v (%s), want a panic of length 3", r.Violation.Kind, r.Violation.Trace, r.Violation.Detail)
+	if r.Violation.Kind != merilo.ApplyError || len(r.Violation.Trace) != 3 {
+		t.Errorf("got %v with trace %v (%s), want an apply error of length 3", r.Violation.Kind, r.Violation.Trace, r.Violation.Detail)
 	}
 }
 
@@ -225,45 +240,26 @@ type expectFail struct{ *testing.T }
 
 func (e *expectFail) Errorf(format string, args ...any) { e.Logf("expected: "+format, args...) }
 
-// AC-04: the correct coordinator verifies completely.
+// The correct coordinator verifies completely.
 func TestCorrect(t *testing.T) {
 	r := merilo.Explore(t, newSys(coord.NoBug), opts)
 	if !r.Complete || r.Violation.Found() {
 		t.Fatalf("complete=%t violation=%v", r.Complete, r.Violation.Kind)
 	}
-	want := map[[2]string]bool{
-		{"Normal", "Degraded"}: true, {"Normal", "Closed"}: true, {"Degraded", "Recovering"}: true,
-		{"Degraded", "Closed"}: true, {"Recovering", "Normal"}: true,
-	}
-	for _, e := range r.ModeEdges {
-		delete(want, e)
-	}
-	if len(want) != 0 {
-		t.Errorf("declared mode changes never taken: %v", want)
-	}
-}
-
-// AC-06: the seeds alone reach every reachable mode edge.
-func TestCoverageFromSeeds(t *testing.T) {
-	r := merilo.Explore(t, newSys(coord.NoBug), opts)
-	merilo.Coverage(t, newSys(coord.NoBug), "FuzzCorrect", r,
-		merilo.FuzzOptions{MaxDepth: 30, Seeds: r.Witnesses},
-		merilo.CoverageMin{Modes: 100, ModeEdges: 100, Tuples: 100})
 }
 
 func FuzzCorrect(f *testing.F) {
-	r := merilo.Explore(f, newSys(coord.NoBug), opts)
-	merilo.Fuzz(f, newSys(coord.NoBug), merilo.FuzzOptions{MaxDepth: 30, Seeds: r.Witnesses})
+	merilo.Fuzz(f, newSys(coord.NoBug), merilo.FuzzOptions{MaxDepth: 30, Explore: opts})
 }
 
-// FuzzSeededShallow is AC-05: the explorer is bounded below the bug's
-// depth, so only fuzzing from its witnesses can find the bug. Run it with
+// FuzzSeededShallow: the explorer stores too few worlds to reach
+// the bug's depth, so only fuzzing from its witnesses can find the bug. Run it with
 // go test -run '^$' -fuzz FuzzSeededShallow; it is expected to fail.
 func FuzzSeededShallow(f *testing.F) {
-	shallow := merilo.Options{MaxDepth: 2, MaxStates: 10000}
+	shallow := merilo.Options{MaxStates: 8} // every world within 2 steps; the bug is 3 away
 	r := merilo.Explore(f, newSys(coord.CommitOnTimeout), shallow)
 	if r.Violation.Found() {
 		f.Fatal("bounded search should not reach the bug")
 	}
-	merilo.Fuzz(f, newSys(coord.CommitOnTimeout), merilo.FuzzOptions{MaxDepth: 30, Seeds: r.Witnesses})
+	merilo.Fuzz(f, newSys(coord.CommitOnTimeout), merilo.FuzzOptions{MaxDepth: 30, Explore: shallow})
 }

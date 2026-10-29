@@ -1,0 +1,138 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - staticcheck
+    - unused
+    - errcheck
+    - govet
+    - ineffassign
+    - gosec
+    - depguard
+    - forbidigo
+    - gocritic
+    - forcetypeassert
+    - funlen
+    - gocognit
+    - gochecknoinits
+    - gochecknoglobals
+    - nilerr
+    - errorlint
+    - wrapcheck
+    - prealloc
+    - makezero
+    - exhaustive
+    - goconst
+    - misspell
+    - godot
+  settings:
+    depguard:
+      rules:
+        all:
+          list-mode: lax
+          files:
+            - "$all"
+            - "!$test"
+          deny:
+            - pkg: reflect
+              desc: "no reflect"
+            - pkg: unsafe
+              desc: "no unsafe"
+            - pkg: plugin
+              desc: "not allowed"
+            - pkg: text/template
+              desc: "not allowed"
+            - pkg: html/template
+              desc: "not allowed"
+        tests:
+          list-mode: lax
+          files:
+            - "$test"
+          deny:
+            - pkg: reflect
+              desc: "no reflect"
+            - pkg: unsafe
+              desc: "no unsafe"
+        deps:
+          list-mode: strict
+          files:
+            - "$all"
+          allow:
+            - $gostd
+            - code.eitanity.com/merilo
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: ^time\.(Now|Since|Sleep)$
+          msg: "no wall-clock time in merilo; machines get time only through events"
+        - pattern: ^rand\.
+          msg: "no randomness"
+        - pattern: ^os\.(Getenv|LookupEnv|Environ)$
+          msg: "no environment reads"
+        - pattern: ^os\.Exit$
+          msg: "exit only from main"
+    funlen:
+      lines: 60
+      statements: -1
+      ignore-comments: true
+    gocognit:
+      min-complexity: 20
+    exhaustive:
+      default-signifies-exhaustive: true
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+    wrapcheck:
+      ignore-package-globs:
+        - code.eitanity.com/merilo
+        - code.eitanity.com/merilo/*
+      ignore-sigs:
+        - errors.New(
+        - errors.Join(
+        - .Errorf(
+        - errors.Unwrap(
+    gosec:
+      excludes:
+        - G104 # errcheck covers unhandled errors
+  exclusions:
+    rules:
+      # The owner loop of a production holder may read the clock and exit.
+      - path: examples/order/cmd/orderd/main\.go
+        linters: [forbidigo]
+        text: "time\\.|os\\.Exit"
+      # The fib holder is a command: it exits with its status code.
+      - path: examples/fib/cmd/fib/main\.go
+        linters: [forbidigo]
+        text: "os\\.Exit"
+      # merilovet is a command: it exits with its status code.
+      - path: cmd/merilovet/main\.go
+        linters: [forbidigo]
+        text: "os\\.Exit"
+      # merilovet finds the target and the module cache in the environment,
+      # as the go command does. The ban on environment reads covers
+      # exploration, not it.
+      - path: cmd/merilovet/discover\.go
+        linters: [forbidigo]
+        text: "os\\.Getenv"
+      # merilovet reads the checked module's go.mod and sources by design.
+      - path: cmd/merilovet/(modfile|load|discover)\.go
+        linters: [gosec]
+        text: "G304"
+      # The AC-15 fixture is impure on purpose: a helper with hidden state.
+      - path: internal/impure/clock/
+        linters: [gochecknoglobals]
+      - path: _test\.go
+        linters: [funlen, gocognit, gochecknoglobals, goconst, wrapcheck, gosec, forcetypeassert]
+      - path: cmd/merilovet/testdata/
+        linters: [all]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -1,5 +1,7 @@
 package m
 
+import "code.eitanity.com/merilo/fsm"
+
 func (m Machine) Mode() Mode {
 	switch m.state {
 	case Idle, Pending:
@@ -7,44 +9,49 @@ func (m Machine) Mode() Mode {
 	case Paid:
 		return Closed
 	default:
-		panic("m: invalid state")
+		return modeNone
 	}
 }
 
-func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
+func (m Machine) Fire(e Event) (Machine, Actions, fsm.Outcome) {
 	switch m.state {
 	case Idle:
 		return m.fireIdle(e)
 	case Pending:
 		return m.firePending(e)
 	case Paid:
-		return m, Actions{}, Ignored
+		return m, Actions{}, fsm.Ignored
 	default:
-		panic("m: invalid state")
+		return m, Actions{}, fsm.Invalid
 	}
 }
 
-func (m Machine) fireIdle(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireIdle(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit:
+		if m.count >= maxCount {
+			return m, Actions{}, fsm.Rejected
+		}
 		m.state = Pending
 		m.count++
-		return m, one(ActSend), Moved
+		return m, one(ActSend), fsm.Moved
 	case EvAck:
-		return m, Actions{}, Rejected
+		return m, Actions{}, fsm.Rejected
 	default:
-		panic("m: invalid event")
+		return m, Actions{}, fsm.Invalid
 	}
 }
 
-func (m Machine) firePending(e Event) (Machine, Actions, Outcome) {
+func (m Machine) firePending(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvSubmit:
-		return m, Actions{}, Rejected
+		return m, Actions{}, fsm.Rejected
 	case EvAck:
 		m.state = Paid
-		return m, Actions{}, Moved
+		return m, Actions{}, fsm.Moved
 	default:
-		panic("m: invalid event")
+		return m, Actions{}, fsm.Invalid
 	}
 }
+
+const maxCount = 8

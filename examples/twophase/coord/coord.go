@@ -4,12 +4,15 @@
 // for the acceptance tests.
 package coord
 
+import "code.eitanity.com/merilo/fsm"
+
 // Participants is the number of votes a commit needs.
 const Participants = 2
 
 // State is the coordinator's control state.
 type State uint8
 
+// State values.
 const (
 	stateNone State = iota
 	Init
@@ -24,6 +27,7 @@ const (
 // Event is an input to Fire.
 type Event uint8
 
+// Event values.
 const (
 	eventNone Event = iota
 	EvStart
@@ -37,6 +41,7 @@ const (
 // Mode is derived from State.
 type Mode uint8
 
+// Mode values.
 const (
 	modeNone Mode = iota
 	Normal
@@ -46,12 +51,14 @@ const (
 	numModes
 )
 
-// Action is something the holder must do after a transition.
-type Action uint8
+// Actions is the set of things the holder must do after a transition, one
+// bit each. The holder performs them in declaration order. The zero value
+// is the empty set.
+type Actions uint64
 
+// Actions values.
 const (
-	ActNone Action = iota
-	ActPrepare
+	ActPrepare Actions = 1 << iota
 	ActCommit
 	ActAbort
 	ActStartTimer
@@ -59,19 +66,10 @@ const (
 	ActModeChanged
 )
 
-// Outcome reports what Fire did with an event.
-type Outcome uint8
-
-const (
-	outcomeNone Outcome = iota
-	Moved
-	Ignored
-	Rejected
-)
-
 // Bug selects a seeded defect. NoBug is the correct coordinator.
 type Bug uint8
 
+// Bug values.
 const (
 	bugNone Bug = iota
 	NoBug
@@ -79,40 +77,10 @@ const (
 	SkipRecovery    // returns from Retrying straight to Collecting
 )
 
-const maxActions = 3
-
-// Actions is a fixed-size list of actions.
-type Actions struct {
-	list [maxActions]Action
-	n    uint8
-}
-
-// Len is the number of actions.
-func (a Actions) Len() int { return int(a.n) }
-
-// At returns action i, which must be below Len.
-func (a Actions) At(i int) Action {
-	if i < 0 || i >= int(a.n) {
-		panic("coord: action index out of range")
-	}
-	return a.list[i]
-}
-
-func one(x Action) Actions { return Actions{}.with(x) }
-
-func (a Actions) with(x Action) Actions {
-	if int(a.n) >= maxActions {
-		panic("coord: more than maxActions actions")
-	}
-	a.list[a.n] = x
-	a.n++
-	return a
-}
-
 // Machine is one coordinator. Build it with New and change it only with Fire.
 type Machine struct {
 	state State
-	yes   uint8
+	yes   fsm.Counter // yes votes this round, up to Participants
 	bug   Bug
 }
 
@@ -121,9 +89,9 @@ type Machine struct {
 func New(b Bug) Machine {
 	switch b {
 	case NoBug, CommitOnTimeout, SkipRecovery:
-		return Machine{state: Init, bug: b}
+		return Machine{state: Init, yes: fsm.NewCounter(Participants), bug: b}
 	default:
-		panic("coord: invalid bug")
+		return Machine{}
 	}
 }
 
@@ -131,7 +99,7 @@ func New(b Bug) Machine {
 func (m Machine) State() State { return m.state }
 
 // Yes returns the yes votes counted in this round.
-func (m Machine) Yes() uint8 { return m.yes }
+func (m Machine) Yes() int64 { return m.yes.Value() }
 
 // Mode derives the mode from the state.
 func (m Machine) Mode() Mode {
@@ -145,13 +113,8 @@ func (m Machine) Mode() Mode {
 	case Committed, Aborted:
 		return Closed
 	default:
-		panic("coord: invalid state; machine not built with New")
+		return modeNone
 	}
-}
-
-// AppendKey appends every field, in declaration order.
-func (m Machine) AppendKey(b []byte) []byte {
-	return append(b, byte(m.state), m.yes, byte(m.bug))
 }
 
 func modeAllowed(from, to Mode) bool {
@@ -165,15 +128,15 @@ func modeAllowed(from, to Mode) bool {
 	case Closed:
 		return false
 	default:
-		panic("coord: invalid mode")
+		return false
 	}
 }
 
 // Fire applies e and returns the next machine, its actions and what happened.
-func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
+func (m Machine) Fire(e Event) (Machine, Actions, fsm.Outcome) {
 	var next Machine
 	var acts Actions
-	var out Outcome
+	var out fsm.Outcome
 	switch m.state {
 	case Init:
 		next, acts, out = m.fireInit(e)
@@ -186,105 +149,113 @@ func (m Machine) Fire(e Event) (Machine, Actions, Outcome) {
 	case Committed, Aborted:
 		next, acts, out = m.fireClosed(e)
 	default:
-		panic("coord: invalid state; machine not built with New")
+		return m, 0, fsm.Invalid
 	}
 	if next.Mode() != m.Mode() {
 		if !modeAllowed(m.Mode(), next.Mode()) {
-			panic("coord: undeclared mode change")
+			return m, 0, fsm.Invalid
 		}
-		acts = acts.with(ActModeChanged)
+		acts |= ActModeChanged
 	}
 	return next, acts, out
 }
 
-func (m Machine) fireInit(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireInit(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvStart:
 		m.state = Collecting
-		return m, one(ActPrepare).with(ActStartTimer), Moved
+		return m, ActPrepare | ActStartTimer, fsm.Moved
 	case EvYes, EvNo, EvTimeout, EvResume:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("coord: undeclared event in Init")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireCollecting(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireCollecting(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvStart:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvYes:
-		m.yes++
-		if m.yes == Participants {
-			m.state = Committed
-			return m, one(ActCommit).with(ActCancelTimer), Moved
+		yes, ok := m.yes.Inc()
+		if !ok {
+			return m, 0, fsm.Invalid // more yes votes than participants
 		}
-		return m, Actions{}, Moved
+		m.yes = yes
+		if yes.Full() {
+			m.state = Committed
+			return m, ActCommit | ActCancelTimer, fsm.Moved
+		}
+		return m, 0, fsm.Moved
 	case EvNo:
 		m.state = Aborted
-		return m, one(ActAbort).with(ActCancelTimer), Moved
+		return m, ActAbort | ActCancelTimer, fsm.Moved
 	case EvTimeout:
-		if m.bug == CommitOnTimeout && m.yes > 0 {
+		if m.bug == CommitOnTimeout && m.yes.Value() > 0 {
 			m.state = Committed
-			return m, one(ActCommit), Moved
+			return m, ActCommit, fsm.Moved
 		}
 		m.state = Retrying
-		return m, one(ActPrepare).with(ActStartTimer), Moved
+		return m, ActPrepare | ActStartTimer, fsm.Moved
 	case EvResume:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("coord: undeclared event in Collecting")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireRetrying(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireRetrying(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvStart:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvYes:
-		m.yes++
-		switch {
-		case m.yes == Participants:
+		yes, ok := m.yes.Inc()
+		if !ok {
+			return m, 0, fsm.Invalid // more yes votes than participants
+		}
+		m.yes = yes
+		if yes.Full() {
 			m.state = Committed
-			return m, one(ActCommit).with(ActCancelTimer), Moved
-		case m.bug == SkipRecovery:
+			return m, ActCommit | ActCancelTimer, fsm.Moved
+		}
+		if m.bug == SkipRecovery {
 			m.state = Collecting
-			return m, Actions{}, Moved
+			return m, 0, fsm.Moved
 		}
 		m.state = Recovering
-		return m, one(ActCancelTimer), Moved
+		return m, ActCancelTimer, fsm.Moved
 	case EvNo, EvTimeout:
 		m.state = Aborted
-		return m, one(ActAbort).with(ActCancelTimer), Moved
+		return m, ActAbort | ActCancelTimer, fsm.Moved
 	case EvResume:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("coord: undeclared event in Retrying")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireRecovering(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireRecovering(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvStart:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvYes, EvNo, EvTimeout:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	case EvResume:
 		m.state = Collecting
-		return m, one(ActStartTimer), Moved
+		return m, ActStartTimer, fsm.Moved
 	default:
-		panic("coord: undeclared event in Recovering")
+		return m, 0, fsm.Invalid
 	}
 }
 
-func (m Machine) fireClosed(e Event) (Machine, Actions, Outcome) {
+func (m Machine) fireClosed(e Event) (Machine, Actions, fsm.Outcome) {
 	switch e {
 	case EvStart:
-		return m, Actions{}, Rejected
+		return m, 0, fsm.Rejected
 	case EvYes, EvNo, EvTimeout, EvResume:
-		return m, Actions{}, Ignored
+		return m, 0, fsm.Ignored
 	default:
-		panic("coord: undeclared event in a closed state")
+		return m, 0, fsm.Invalid
 	}
 }
 
@@ -303,7 +274,7 @@ func (s State) String() string {
 	case Aborted:
 		return "Aborted"
 	default:
-		panic("coord: invalid state")
+		return "invalid"
 	}
 }
 
@@ -318,6 +289,6 @@ func (m Mode) String() string {
 	case Closed:
 		return "Closed"
 	default:
-		panic("coord: invalid mode")
+		return "invalid"
 	}
 }

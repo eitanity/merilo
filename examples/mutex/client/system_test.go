@@ -5,17 +5,34 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/eitanity/merilo"
-	"github.com/eitanity/merilo/examples/mutex/client"
+	"code.eitanity.com/merilo"
+	"code.eitanity.com/merilo/examples/mutex/client"
+	"code.eitanity.com/merilo/fsm"
 )
 
+// Step kinds. A client step has one kind per client and a network step
+// one per envelope slot: kWant+i is client i wanting the lock, kDeliver+i
+// delivers the envelope in slot i, and so on.
 const (
-	kWant merilo.Kind = iota
-	kDone
-	kDeliver
-	kDup
-	numKinds
+	kWant    = 0
+	kDone    = kWant + clients
+	kDeliver = kDone + clients
+	kDup     = kDeliver + maxInflight
+	numKinds = kDup + maxInflight
 )
+
+// slot splits kind k into its step and the client or slot it names.
+func slot(k int) (step, i int) {
+	switch {
+	case k >= kDup:
+		return kDup, k - kDup
+	case k >= kDeliver:
+		return kDeliver, k - kDeliver
+	case k >= kDone:
+		return kDone, k - kDone
+	}
+	return kWant, k - kWant
+}
 
 const clients = 2
 
@@ -30,7 +47,7 @@ const (
 
 type envelope struct {
 	kind msgKind
-	who  uint8
+	who  int
 }
 
 func (e envelope) less(f envelope) bool {
@@ -40,22 +57,18 @@ func (e envelope) less(f envelope) bool {
 // One request and one release per client, a grant for each, one duplicate.
 const maxInflight = 3*clients + 1
 
-type mode string
-
-func (m mode) String() string { return string(m) }
-
 // sys is two clients, a lock server and a network that may duplicate one
 // message.
 type sys struct {
 	seeded   bool
 	c        [clients]client.Machine
 	wanted   [clients]bool
-	holder   int8 // -1 when free
+	holder   int // -1 when free
 	waiting  [clients]bool
 	served   [clients]bool // each client asks once, so a served request is a duplicate
 	inflight [maxInflight]envelope
 	n        int
-	dups     uint8
+	dups     int
 }
 
 func newSys(seeded bool) *sys {
@@ -68,64 +81,63 @@ func (s *sys) Reset() {
 	*s = sys{seeded: s.seeded, c: [clients]client.Machine{client.New(s.seeded), client.New(s.seeded)}, holder: -1, dups: 1}
 }
 
-func (s *sys) Kinds() int           { return int(numKinds) }
+func (s *sys) Kinds() int           { return numKinds }
 func (s *sys) Invariants() []string { return []string{"at most one client holds the lock"} }
 
-func (s *sys) Steps(buf []merilo.Step) []merilo.Step {
-	for i := range clients {
-		if !s.wanted[i] && s.c[i].State() == client.Idle {
-			buf = append(buf, merilo.Step{Kind: kWant, Arg: i})
-		}
-		if s.c[i].State() == client.Holding {
-			buf = append(buf, merilo.Step{Kind: kDone, Arg: i})
-		}
+func (s *sys) Enabled(k int) bool {
+	if k < 0 || k >= numKinds {
+		return false
 	}
-	for i := range s.n {
-		buf = append(buf, merilo.Step{Kind: kDeliver, Arg: i})
+	step, i := slot(k)
+	switch step {
+	case kWant:
+		return !s.wanted[i] && s.c[i].State() == client.Idle
+	case kDone:
+		return s.c[i].State() == client.Holding
+	case kDeliver:
+		return i < s.n
+	case kDup:
+		return i < s.n && s.dups > 0 && s.n < maxInflight
 	}
-	if s.dups > 0 && s.n < maxInflight {
-		for i := range s.n {
-			buf = append(buf, merilo.Step{Kind: kDup, Arg: i})
-		}
-	}
-	return buf
+	return false
 }
 
-func (s *sys) Apply(st merilo.Step) error {
-	switch st.Kind {
+func (s *sys) Apply(k int) error {
+	step, i := slot(k)
+	switch step {
 	case kWant:
-		s.wanted[st.Arg] = true
-		return s.fire(st.Arg, client.EvWant)
+		s.wanted[i] = true
+		return s.fire(i, client.EvWant)
 	case kDone:
-		return s.fire(st.Arg, client.EvDone)
+		return s.fire(i, client.EvDone)
 	case kDeliver:
-		return s.deliver(s.take(st.Arg))
+		return s.deliver(s.take(i))
 	case kDup:
 		s.dups--
-		return s.send(s.inflight[st.Arg])
+		return s.send(s.inflight[i])
 	default:
-		return fmt.Errorf("unknown step kind %d", st.Kind)
+		return fmt.Errorf("unknown step kind %d", k)
 	}
 }
 
 func (s *sys) fire(i int, e client.Event) error {
 	var acts client.Actions
-	var out client.Outcome
+	var out fsm.Outcome
 	s.c[i], acts, out = s.c[i].Fire(e)
-	if out == client.Rejected {
+	if out == fsm.Rejected || out == fsm.Invalid {
 		return fmt.Errorf("client %d rejected event %d", i, e)
 	}
-	for k := range acts.Len() {
-		switch acts.At(k) {
+	for a := client.Actions(1); a != 0; a <<= 1 {
+		switch acts & a {
 		case client.ActRequest:
-			if err := s.send(envelope{msgRequest, uint8(i)}); err != nil {
+			if err := s.send(envelope{msgRequest, i}); err != nil {
 				return err
 			}
 		case client.ActRelease:
-			if err := s.send(envelope{msgRelease, uint8(i)}); err != nil {
+			if err := s.send(envelope{msgRelease, i}); err != nil {
 				return err
 			}
-		case client.ActModeChanged, client.ActNone:
+		case client.ActModeChanged:
 		}
 	}
 	return nil
@@ -133,29 +145,29 @@ func (s *sys) fire(i int, e client.Event) error {
 
 // deliver hands a message to the server or to a client.
 func (s *sys) deliver(e envelope) error {
-	who := int(e.who)
+	who := e.who
 	switch e.kind {
 	case msgGrant:
 		return s.fire(who, client.EvGrant)
 	case msgRequest:
-		if s.served[who] || s.waiting[who] || int(s.holder) == who {
+		if s.served[who] || s.waiting[who] || s.holder == who {
 			return nil // duplicate request: the server is idempotent
 		}
 		if s.holder >= 0 {
 			s.waiting[who] = true
 			return nil
 		}
-		s.holder, s.served[who] = int8(who), true
+		s.holder, s.served[who] = who, true
 		return s.send(envelope{msgGrant, e.who})
 	case msgRelease:
-		if int(s.holder) != who {
+		if s.holder != who {
 			return nil
 		}
 		s.holder = -1
 		for j := range clients {
 			if s.waiting[j] {
-				s.waiting[j], s.holder, s.served[j] = false, int8(j), true
-				return s.send(envelope{msgGrant, uint8(j)})
+				s.waiting[j], s.holder, s.served[j] = false, j, true
+				return s.send(envelope{msgGrant, j})
 			}
 		}
 		return nil
@@ -185,24 +197,9 @@ func (s *sys) take(i int) envelope {
 	return e
 }
 
-func (s *sys) Key(buf []byte) []byte {
-	for i := range clients {
-		buf = s.c[i].AppendKey(buf)
-		buf = append(buf, b(s.wanted[i]), b(s.waiting[i]), b(s.served[i]))
-	}
-	buf = append(buf, byte(s.holder), s.dups, byte(s.n))
-	for _, e := range s.inflight {
-		buf = append(buf, byte(e.kind), e.who)
-	}
-	return buf
-}
-
-func b(v bool) byte {
-	if v {
-		return 1
-	}
-	return 0
-}
+// World is the whole adapter: both clients, the server's state and the
+// network, whose envelopes sit in a fixed array.
+func (s *sys) World() any { return *s }
 
 func (s *sys) Check() error {
 	holding := 0
@@ -217,8 +214,7 @@ func (s *sys) Check() error {
 	return nil
 }
 
-func (s *sys) Mode() fmt.Stringer { return mode("Normal") }
-func (s *sys) Tuple() string      { return s.c[0].State().String() + "," + s.c[1].State().String() }
+func (s *sys) Tuple() string { return s.c[0].State().String() + "," + s.c[1].State().String() }
 
 func (s *sys) Settled() bool {
 	for i := range clients {
@@ -229,25 +225,26 @@ func (s *sys) Settled() bool {
 	return true
 }
 
-func (s *sys) Describe(st merilo.Step) string {
+func (s *sys) Describe(k int) string {
 	names := map[msgKind]string{msgRequest: "request", msgRelease: "release", msgGrant: "grant"}
-	switch st.Kind {
+	step, i := slot(k)
+	switch step {
 	case kWant:
-		return fmt.Sprintf("c%d wants the lock", st.Arg)
+		return fmt.Sprintf("c%d wants the lock", i)
 	case kDone:
-		return fmt.Sprintf("c%d is done", st.Arg)
+		return fmt.Sprintf("c%d is done", i)
 	case kDeliver, kDup:
-		e := s.inflight[st.Arg]
-		verb := map[merilo.Kind]string{kDeliver: "deliver", kDup: "duplicate"}[st.Kind]
+		e := s.inflight[i]
+		verb := map[int]string{kDeliver: "deliver", kDup: "duplicate"}[step]
 		return fmt.Sprintf("%s %s c%d", verb, names[e.kind], e.who)
 	default:
-		return fmt.Sprintf("kind %d", st.Kind)
+		return fmt.Sprintf("kind %d", k)
 	}
 }
 
-var opts = merilo.Options{MaxDepth: 40, MaxStates: 100000, RequireComplete: true}
+var opts = merilo.Options{MaxStates: 100000, RequireComplete: true}
 
-// AC-02: a client that takes a duplicated grant while idle ends up
+// A client that takes a duplicated grant while idle ends up
 // holding the lock alongside the rightful holder.
 func TestSeededDuplicateGrant(t *testing.T) {
 	r := merilo.Explore(&expectFail{T: t}, newSys(true), opts)
@@ -261,11 +258,10 @@ type expectFail struct{ *testing.T }
 
 func (e *expectFail) Errorf(format string, args ...any) { e.Logf("expected: "+format, args...) }
 
-// AC-04: the correct client keeps the lock exclusive.
+// The correct client keeps the lock exclusive.
 func TestCorrect(t *testing.T) {
 	r := merilo.Explore(t, newSys(false), opts)
 	if !r.Complete || r.Violation.Found() {
 		t.Fatalf("complete=%t violation=%v", r.Complete, r.Violation.Kind)
 	}
-	merilo.CheckDeterminism(t, newSys(false), opts)
 }
